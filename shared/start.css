@@ -113,3 +113,6 @@
   .st-go { width: 100%; justify-content: center; }
   .st-actions { align-items: stretch; }
 }
+
+/* dipakai halaman untuk menyembunyikan layar pembuka dan HUD (tombol H) */
+.hide { display: none !important; }
