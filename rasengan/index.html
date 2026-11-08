@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rasengan Detector</title>
+<style>
+  :root { --cyan:#7fd8ff; --blue:#2f8bff; --ink:#eaf6ff; }
+  html,body { margin:0; height:100%; background:#05070c; overflow:hidden;
+    font-family: ui-sans-serif, -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif; color:var(--ink); }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  video { display:none; }
+  #hud { position:fixed; inset:0; pointer-events:none; }
+  #label { position:absolute; top:5vh; left:0; right:0; text-align:center; font-weight:800;
+    letter-spacing:.14em; font-size:clamp(14px,2.4vw,26px); text-transform:uppercase;
+    text-shadow:0 2px 18px rgba(0,0,0,.8); transition:opacity .25s; }
+  #bar { position:absolute; bottom:6vh; left:50%; transform:translateX(-50%); width:min(46vw,420px);
+    height:8px; border-radius:8px; background:rgba(255,255,255,.12); overflow:hidden; }
+  #fill { height:100%; width:0%; background:linear-gradient(90deg,var(--blue),var(--cyan),#fff); box-shadow:0 0 18px var(--cyan); }
+  #stat { position:absolute; bottom:2vh; left:0; right:0; text-align:center; font-size:12px; opacity:.45; letter-spacing:.1em; }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../shared/start.css">
+</head>
+<body>
+<video id="cam" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="label">Memuat…</div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="stat"></div>
+</div>
+<div id="start" style="--accent:#7fd8ff">
+  <div class="st-wrap">
+    <header class="st-head">
+      <h1 class="st-title">Rasengan</h1>
+      <p class="st-lede">Bola energi yang berputar di telapak tanganmu.</p>
+    </header>
+    <ol class="st-steps"><li><p><b>Buka telapak tangan</b><span>ke arah kamera, lalu tahan sebentar.</span></p></li><li><p><b>Putar tangan satunya</b><span>melingkar di depan telapak. Makin cepat, makin cepat penuh.</span></p></li><li><p><b>Dorong ke kamera</b><span>begitu bola penuh dan muncul tulisan “Dorong!”.</span></p></li></ol>
+    <div class="st-actions">
+      <div class="st-row">
+        <button id="go" class="st-go" type="button"><span class="st-label">Mulai kamera</span><svg class="st-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><svg class="st-spin" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-opacity=".3" stroke-width="2.5"/><path d="M17.5 10A7.5 7.5 0 0 0 10 2.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></button>
+        <button id="demo" class="st-ghost" type="button">Coba tanpa kamera (mouse)</button>
+      </div>
+      <p class="st-privacy"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.5"/></svg>Kamera diproses langsung di perangkatmu. Tidak ada video yang dikirim.</p>
+      <p id="err" role="alert"></p>
+    </div>
+    <footer class="st-keys"><span><kbd>H</kbd>sembunyikan HUD</span><span><kbd>L</kbd>titik tangan</span><span><kbd>M</kbd>mode demo</span><span><kbd>R</kbd>reset</span><span><kbd>C</kbd>awan</span></footer>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- tunables ----------
+const T = {
+  holdToStart: 0.35,     // detik telapak terbuka sebelum mulai charge
+  baseRate: 0.10,        // charge/detik tanpa putaran
+  spinRate: 0.75,        // tambahan charge/detik saat putaran maksimal
+  spinFull: 9,           // rad/detik dianggap putaran maksimal (~1.4 putaran/dtk)
+  thrustRatio: 1.25,     // ukuran tangan membesar 25% dalam window = dorong
+  thrustDist: 0.22,      // atau bergeser 22% layar
+  thrustWindow: 0.28,    // detik
+  minChargeToFire: 0.7,
+  orbScale: 0.95,        // radius orb penuh relatif ke ukuran tangan
+};
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const video = document.getElementById('cam');
+const $label = document.getElementById('label'), $fill = document.getElementById('fill'), $stat = document.getElementById('stat');
+let W = 0, H = 0, DPR = 1;
+function resize(){ DPR = Math.min(devicePixelRatio||1, 2); W = innerWidth; H = innerHeight; cv.width = W*DPR; cv.height = H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); }
+addEventListener('resize', resize); resize();
+
+let landmarker = null, demo = false, showHud = true, showLm = false, running = false;
+let mouse = { x: W/2, y: H*0.6, down:false };
+
+// ---------- audio (semua disintesis, tanpa file) ----------
+let A = null;
+function initAudio(){
+  if (A) return;
+  const ac = new (window.AudioContext||window.webkitAudioContext)();
+  const master = ac.createGain(); master.gain.value = 0.8; master.connect(ac.destination);
+  const noiseBuf = ac.createBuffer(1, ac.sampleRate*2, ac.sampleRate);
+  const d = noiseBuf.getChannelData(0); for (let i=0;i<d.length;i++) d[i] = Math.random()*2-1;
+  // hum
+  const o1 = ac.createOscillator(), o2 = ac.createOscillator(); o1.type = o2.type = 'sawtooth';
+  o1.frequency.value = 70; o2.frequency.value = 71.3;
+  const lp = ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value = 300; lp.Q.value = 6;
+  const humG = ac.createGain(); humG.gain.value = 0;
+  o1.connect(lp); o2.connect(lp); lp.connect(humG); humG.connect(master); o1.start(); o2.start();
+  // wind
+  const ns = ac.createBufferSource(); ns.buffer = noiseBuf; ns.loop = true;
+  const bp = ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value = 800; bp.Q.value = 1.4;
+  const windG = ac.createGain(); windG.gain.value = 0;
+  ns.connect(bp); bp.connect(windG); windG.connect(master); ns.start();
+  A = { ac, master, noiseBuf, o1, o2, lp, humG, bp, windG };
+}
+function audioCharge(active, charge, spin){
+  if (!A) return; const t = A.ac.currentTime, k = 0.08;
+  A.humG.gain.setTargetAtTime(active ? 0.05 + 0.13*charge : 0, t, k);
+  A.o1.frequency.setTargetAtTime(60 + 110*charge, t, k); A.o2.frequency.setTargetAtTime(61.5 + 113*charge, t, k);
+  A.lp.frequency.setTargetAtTime(250 + 2600*charge, t, k);
+  A.windG.gain.setTargetAtTime(active ? 0.04 + 0.22*charge + 0.1*Math.min(spin/T.spinFull,1) : 0, t, k);
+  A.bp.frequency.setTargetAtTime(500 + 1800*charge + 400*Math.sin(t*9), t, 0.03);
+}
+function audioBoom(){
+  if (!A) return; const ac = A.ac, t = ac.currentTime;
+  const s = ac.createOscillator(); s.type='sine'; s.frequency.setValueAtTime(140,t); s.frequency.exponentialRampToValueAtTime(28,t+0.9);
+  const sg = ac.createGain(); sg.gain.setValueAtTime(0.9,t); sg.gain.exponentialRampToValueAtTime(0.001,t+1.1);
+  s.connect(sg); sg.connect(A.master); s.start(t); s.stop(t+1.2);
+  const n = ac.createBufferSource(); n.buffer = A.noiseBuf;
+  const f = ac.createBiquadFilter(); f.type='lowpass'; f.frequency.setValueAtTime(6000,t); f.frequency.exponentialRampToValueAtTime(200,t+1.2);
+  const ng = ac.createGain(); ng.gain.setValueAtTime(0.8,t); ng.gain.exponentialRampToValueAtTime(0.001,t+1.3);
+  n.connect(f); f.connect(ng); ng.connect(A.master); n.start(t); n.stop(t+1.4);
+}
+function audioFizzle(){
+  if (!A) return; const ac = A.ac, t = ac.currentTime;
+  const n = ac.createBufferSource(); n.buffer = A.noiseBuf;
+  const f = ac.createBiquadFilter(); f.type='highpass'; f.frequency.value = 2000;
+  const g = ac.createGain(); g.gain.setValueAtTime(0.25,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.4);
+  n.connect(f); f.connect(g); g.connect(A.master); n.start(t); n.stop(t+0.5);
+}
+
+// ---------- hand analysis ----------
+const PALM = [0,5,9,13,17], FINGERS = [[8,6],[12,10],[16,14],[20,18]];
+let cover = { s:1, ox:0, oy:0, dw:W, dh:H };
+function computeCover(){
+  const vw = video.videoWidth||1280, vh = video.videoHeight||720;
+  const s = Math.max(W/vw, H/vh); cover = { s, dw:vw*s, dh:vh*s, ox:(W-vw*s)/2, oy:(H-vh*s)/2, vw, vh };
+}
+function analyse(lms){
+  const { vw, vh } = cover;
+  const p3 = i => ({ x: lms[i].x*vw, y: lms[i].y*vh, z: lms[i].z*vw });
+  const d3 = (a,b) => Math.hypot(a.x-b.x, a.y-b.y, a.z-b.z);
+  const w = p3(0); let ext = 0;
+  for (const [tip,pip] of FINGERS) if (d3(w,p3(tip)) > d3(w,p3(pip))*1.15) ext++;
+  const pts = lms.map(l => ({ x: cover.ox + (1-l.x)*cover.dw, y: cover.oy + l.y*cover.dh })); // mirrored canvas coords
+  let cx=0, cy=0; for (const i of PALM){ cx+=pts[i].x; cy+=pts[i].y; } cx/=PALM.length; cy/=PALM.length;
+  const size = Math.hypot(pts[0].x-pts[9].x, pts[0].y-pts[9].y);
+  return { pts, cx, cy, size, ext, open: ext>=3, fist: ext<=1, tip: pts[8] };
+}
+
+// ---------- state ----------
+const S = { phase:'idle', charge:0, hold:0, lost:0, fistT:0, palm:null, size:120, ang:null, spin:0, hist:[], rel:0, relFrom:null, cool:0 };
+function reset(fizzle){
+  if (fizzle && S.charge>0.15){ audioFizzle(); burst(S.palm?.x??W/2, S.palm?.y??H/2, 40, 0.6); }
+  Object.assign(S, { phase:'idle', charge:0, hold:0, lost:0, fistT:0, palm:null, ang:null, spin:0, hist:[] });
+}
+let shake = 0, flash = 0;
+const parts = [];   // debris / inflow particles
+const rings = [];   // shockwaves
+function burst(x,y,n,pow){
+  for (let i=0;i<n;i++){ const a=Math.random()*Math.PI*2, v=(200+Math.random()*900)*pow;
+    parts.push({ x,y, vx:Math.cos(a)*v, vy:Math.sin(a)*v, life:0.5+Math.random()*0.7, age:0, w:1+Math.random()*3, kind:'debris' }); }
+}
+
+function update(dt, hands, now){
+  const minDim = Math.min(W,H);
+  if (S.phase==='release'){
+    S.rel += dt;
+    if (S.rel>0.32 && !S.exploded){ S.exploded = true; audioBoom(); flash = 1; shake = 1;
+      const {x,y} = S.relPos; burst(x,y,220,1.4);
+      for (let i=0;i<3;i++) rings.push({ x,y, r:20, v:1400+i*700, life:0.9+i*0.2, age:-i*0.06 }); }
+    if (S.rel>1.5){ S.phase='cooldown'; S.cool=0.6; }
+    audioCharge(false,0,0); return;
+  }
+  if (S.phase==='cooldown'){ S.cool-=dt; if (S.cool<=0) reset(false); audioCharge(false,0,0); return; }
+
+  // pick palm hand
+  let palm = null;
+  if (S.palm){ let best=1e9; for (const h of hands){ const d=Math.hypot(h.cx-S.palm.x,h.cy-S.palm.y); if (d<best && d<minDim*0.35){best=d; palm=h;} } }
+  if (!palm) palm = hands.filter(h=>h.open).sort((a,b)=>b.size-a.size)[0] || null;
+  if (!palm){ S.lost+=dt; if (S.lost>0.5 && S.phase!=='idle') reset(true); if (S.phase==='idle') S.hold=0; audioCharge(false,0,0); return; }
+  S.lost = 0;
+  S.palm = S.palm ? { x: S.palm.x+(palm.cx-S.palm.x)*0.55, y: S.palm.y+(palm.cy-S.palm.y)*0.55 } : { x:palm.cx, y:palm.cy };
+  S.size += (palm.size - S.size)*0.4;
+
+  if (S.phase==='idle'){
+    if (palm.open){ S.hold+=dt; if (S.hold>T.holdToStart){ S.phase='charging'; S.charge=0.02; } } else S.hold=0;
+    audioCharge(false,0,0); return;
+  }
+
+  // charging / ready
+  if (palm.fist){ S.fistT+=dt; if (S.fistT>0.25){ reset(true); return; } } else S.fistT=0;
+  const other = hands.find(h=>h!==palm);
+  let spinNow = 0;
+  if (other){
+    const dx = other.tip.x-S.palm.x, dy = other.tip.y-S.palm.y, dist = Math.hypot(dx,dy);
+    if (dist < S.size*3.5){
+      const a = Math.atan2(dy,dx);
+      if (S.ang!==null){ let da=a-S.ang; while(da>Math.PI) da-=2*Math.PI; while(da<-Math.PI) da+=2*Math.PI; spinNow=Math.abs(da)/Math.max(dt,1e-3); }
+      S.ang = a;
+    } else S.ang = null;
+  } else S.ang = null;
+  if (demo && mouse.down) spinNow = T.spinFull*1.2;
+  S.spin += (Math.min(spinNow, T.spinFull*2) - S.spin)*0.15;
+  const rate = T.baseRate + Math.min(S.spin/T.spinFull,1)*T.spinRate;
+  S.charge = Math.min(1, S.charge + rate*dt);
+  if (S.charge>=1) S.phase='ready';
+  // inflow particles while charging
+  if (Math.random() < 0.3 + S.charge*0.7 + Math.min(S.spin/T.spinFull,1)) {
+    const a=Math.random()*Math.PI*2, r=S.size*(2+Math.random()*2.5);
+    parts.push({ x:S.palm.x+Math.cos(a)*r, y:S.palm.y+Math.sin(a)*r, a, r, life:0.6, age:0, kind:'inflow' });
+  }
+  audioCharge(true, S.charge, S.spin);
+
+  // thrust detection
+  S.hist.push({ t:now, size:palm.size, x:palm.cx, y:palm.cy });
+  while (S.hist.length && now - S.hist[0].t > T.thrustWindow*1000) S.hist.shift();
+  const o = S.hist[0];
+  if (S.charge>=T.minChargeToFire && o && now-o.t > 80){
+    const grow = palm.size/o.size, move = Math.hypot(palm.cx-o.x, palm.cy-o.y)/minDim;
+    if (grow>T.thrustRatio || move>T.thrustDist || demo && S.demoThrust) fire();
+  }
+  S.demoThrust = false;
+}
+function fire(){
+  S.phase='release'; S.rel=0; S.exploded=false; S.relFrom={ ...S.palm, R:orbRadius() };
+  S.relPos = { x: S.palm.x + (W/2-S.palm.x)*0.35, y: S.palm.y + (H/2-S.palm.y)*0.35 };
+}
+const orbRadius = () => S.size*T.orbScale*(0.22+0.78*S.charge);
+
+// ---------- drawing ----------
+const swirls = Array.from({length:18}, (_,i)=>({ tilt:i*0.61, squash:0.35+0.6*Math.abs(Math.sin(i*1.7)), sp:2.2+(i%4)*1.1, r:0.45+0.55*((i*37)%18)/18, len:0.9+Math.random()*1.3, off:Math.random()*6.28 }));
+function drawOrb(x,y,R,k,t,wild){
+  ctx.save(); ctx.globalCompositeOperation='lighter';
+  const jx = (Math.random()-0.5)*R*0.06*wild, jy = (Math.random()-0.5)*R*0.06*wild; x+=jx; y+=jy;
+  let g = ctx.createRadialGradient(x,y,0,x,y,R*3);
+  g.addColorStop(0,`rgba(90,180,255,${0.45*k})`); g.addColorStop(0.35,`rgba(40,120,255,${0.18*k})`); g.addColorStop(1,'rgba(0,40,120,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,R*3,0,Math.PI*2); ctx.fill();
+  // spinning shell
+  ctx.lineCap='round';
+  for (const s of swirls){
+    ctx.save(); ctx.translate(x,y); ctx.rotate(s.tilt + t*0.4); ctx.scale(1, s.squash);
+    const a0 = t*s.sp*(1+wild*0.6) + s.off, rr = R*s.r;
+    ctx.strokeStyle=`rgba(160,225,255,${0.55*k})`; ctx.lineWidth=Math.max(1,R*0.05)/s.squash*0.6;
+    ctx.beginPath(); ctx.arc(0,0,rr,a0,a0+s.len); ctx.stroke();
+    ctx.strokeStyle=`rgba(255,255,255,${0.5*k})`; ctx.lineWidth*=0.4;
+    ctx.beginPath(); ctx.arc(0,0,rr,a0+s.len*0.6,a0+s.len); ctx.stroke();
+    ctx.restore();
+  }
+  // wind ring (ready state)
+  if (wild>0.5){
+    ctx.save(); ctx.translate(x,y); ctx.scale(1,0.28);
+    for (let i=0;i<5;i++){ const a0=-t*14+i*1.25; ctx.strokeStyle=`rgba(190,235,255,${0.35*k})`; ctx.lineWidth=R*0.07;
+      ctx.beginPath(); ctx.arc(0,0,R*(1.35+0.12*Math.sin(t*20+i)),a0,a0+0.9); ctx.stroke(); }
+    ctx.restore();
+  }
+  // core
+  g = ctx.createRadialGradient(x,y,0,x,y,R);
+  g.addColorStop(0,`rgba(255,255,255,${0.95*k})`); g.addColorStop(0.35,`rgba(200,240,255,${0.75*k})`);
+  g.addColorStop(0.75,`rgba(80,170,255,${0.35*k})`); g.addColorStop(1,'rgba(40,110,255,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,R,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+function drawParts(dt){
+  ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.lineCap='round';
+  for (let i=parts.length-1;i>=0;i--){ const p=parts[i]; p.age+=dt; if (p.age>p.life){ parts.splice(i,1); continue; }
+    const f = 1-p.age/p.life;
+    if (p.kind==='inflow'){
+      if (!S.palm){ parts.splice(i,1); continue; }
+      const px=p.x, py=p.y; p.a += dt*5; p.r *= Math.pow(0.03, dt);
+      p.x = S.palm.x+Math.cos(p.a)*p.r; p.y = S.palm.y+Math.sin(p.a)*p.r;
+      ctx.strokeStyle=`rgba(170,230,255,${0.7*f})`; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(p.x,p.y); ctx.stroke();
+    } else {
+      const px=p.x, py=p.y; p.vx*=Math.pow(0.12,dt); p.vy*=Math.pow(0.12,dt); p.x+=p.vx*dt; p.y+=p.vy*dt;
+      ctx.strokeStyle=`rgba(${180+60*f|0},235,255,${f})`; ctx.lineWidth=p.w*f+0.5;
+      ctx.beginPath(); ctx.moveTo(px-(p.vx*dt*2),py-(p.vy*dt*2)); ctx.lineTo(p.x,p.y); ctx.stroke();
+    }
+  }
+  for (let i=rings.length-1;i>=0;i--){ const r=rings[i]; r.age+=dt; if (r.age<0) continue; if (r.age>r.life){ rings.splice(i,1); continue; }
+    r.r += r.v*dt; r.v*=Math.pow(0.25,dt); const f=1-r.age/r.life;
+    ctx.strokeStyle=`rgba(170,225,255,${0.8*f})`; ctx.lineWidth=30*f+2; ctx.beginPath(); ctx.arc(r.x,r.y,r.r,0,Math.PI*2); ctx.stroke(); }
+  ctx.restore();
+}
+const BONES=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawLm(h){
+  ctx.strokeStyle='rgba(127,216,255,.6)'; ctx.lineWidth=2;
+  for (const [a,b] of BONES){ ctx.beginPath(); ctx.moveTo(h.pts[a].x,h.pts[a].y); ctx.lineTo(h.pts[b].x,h.pts[b].y); ctx.stroke(); }
+  ctx.fillStyle='#fff'; for (const p of h.pts){ ctx.beginPath(); ctx.arc(p.x,p.y,3,0,7); ctx.fill(); }
+  ctx.fillStyle=h.open?'#7fffb0':h.fist?'#ff8a8a':'#ffd27f'; ctx.font='bold 13px sans-serif'; ctx.fillText(`jari:${h.ext}`, h.cx+10, h.cy);
+}
+
+// ---------- loop ----------
+let last = performance.now(), lastVid = -1, hands = [], fpsAcc=0, fpsN=0, fps=0;
+function frame(now){
+  const dt = Math.min(0.05,(now-last)/1000); last = now; const t = now/1000;
+  fpsAcc+=dt; fpsN++; if (fpsAcc>0.5){ fps=Math.round(fpsN/fpsAcc); fpsAcc=0; fpsN=0; }
+  if (demo){
+    hands = [{ cx:mouse.x, cy:mouse.y, size:Math.min(W,H)*0.16, open:true, fist:false, ext:4, tip:{x:mouse.x,y:mouse.y}, pts:null }];
+  } else if (landmarker && video.readyState>=2 && video.currentTime!==lastVid){
+    lastVid = video.currentTime; computeCover();
+    const res = landmarker.detectForVideo(video, now);
+    hands = (res.landmarks||[]).map(analyse);
+  }
+  update(dt, hands, now);
+
+  // render
+  ctx.save();
+  if (shake>0){ const m=shake*22; ctx.translate((Math.random()-0.5)*m,(Math.random()-0.5)*m); shake=Math.max(0,shake-dt*1.8); }
+  if (!demo && video.readyState>=2){
+    ctx.save(); ctx.translate(cover.ox+cover.dw, cover.oy); ctx.scale(-1,1); ctx.drawImage(video,0,0,cover.dw,cover.dh); ctx.restore();
+  } else { ctx.fillStyle='#0a0f18'; ctx.fillRect(-40,-40,W+80,H+80);
+    if (demo){ ctx.strokeStyle='rgba(255,255,255,.15)'; ctx.setLineDash([6,6]); ctx.beginPath(); ctx.arc(mouse.x,mouse.y,Math.min(W,H)*0.16,0,7); ctx.stroke(); ctx.setLineDash([]); } }
+  // subtle blue tint while charging
+  const tint = S.phase==='charging'||S.phase==='ready' ? S.charge : 0;
+  if (tint>0){ ctx.fillStyle=`rgba(10,40,90,${0.28*tint})`; ctx.fillRect(-40,-40,W+80,H+80); }
+  if (showLm) hands.forEach(h=>h.pts&&drawLm(h));
+  drawParts(dt);
+  if ((S.phase==='charging'||S.phase==='ready') && S.palm) drawOrb(S.palm.x, S.palm.y, orbRadius(), 1, t, S.phase==='ready'?1:Math.min(S.spin/T.spinFull,1)*0.5);
+  if (S.phase==='release' && !S.exploded){
+    const e = Math.min(1,S.rel/0.32), ee = e*e;
+    const x = S.relFrom.x+(S.relPos.x-S.relFrom.x)*ee, y = S.relFrom.y+(S.relPos.y-S.relFrom.y)*ee;
+    drawOrb(x,y, S.relFrom.R + (Math.min(W,H)*0.42-S.relFrom.R)*ee, 1, t*1.6, 1);
+  }
+  ctx.restore();
+  if (flash>0){ ctx.fillStyle=`rgba(225,245,255,${flash})`; ctx.fillRect(0,0,W,H); flash=Math.max(0,flash-dt*2.2); }
+
+  // hud
+  const L = { idle: hands.length? 'Buka telapak tangan, tahan' : 'Tunjukkan tangan ke kamera',
+    charging: S.charge<0.25 ? 'Putar tangan satunya di depan telapak' : 'Terus putar…', ready:'DORONG!', release:'', cooldown:'' }[S.phase];
+  $label.textContent = L; $label.style.opacity = L?1:0;
+  $fill.style.width = (S.phase==='release'||S.phase==='cooldown' ? 0 : S.charge*100)+'%';
+  $stat.textContent = `${demo?'DEMO · ':''}${fps} fps · tangan ${hands.length} · putaran ${S.spin.toFixed(1)} rad/s`;
+  requestAnimationFrame(frame);
+}
+
+// ---------- boot ----------
+async function loadModel(){
+  $label.textContent='Memuat model tangan…';
+  const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await HandLandmarker.createFromOptions(fs, {
+    baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" },
+    runningMode:"VIDEO", numHands:2, minHandDetectionConfidence:0.5, minHandPresenceConfidence:0.5, minTrackingConfidence:0.5 });
+}
+function startLoop(){ if (!running){ running=true; requestAnimationFrame(frame); } }
+document.getElementById('go').onclick = async () => {
+  const err = document.getElementById('err'); err.textContent='';
+  initAudio();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+    video.srcObject = stream; await video.play();
+    await loadModel(); demo=false;
+    document.getElementById('start').classList.add('hide'); startLoop();
+  } catch(e){ console.error(e); err.textContent = 'Gagal: '+(e.message||e.name)+' — coba Mode demo.'; }
+};
+document.getElementById('demo').onclick = () => { initAudio(); demo=true; document.getElementById('start').classList.add('hide'); startLoop(); };
+addEventListener('mousemove', e=>{ mouse.x=e.clientX; mouse.y=e.clientY; });
+addEventListener('mousedown', ()=>mouse.down=true); addEventListener('mouseup', ()=>mouse.down=false);
+addEventListener('keydown', e=>{
+  const k=e.key.toLowerCase();
+  if (k==='h'){ showHud=!showHud; document.getElementById('hud').classList.toggle('hide',!showHud); }
+  if (k==='l') showLm=!showLm;
+  if (k==='r') reset(false);
+  if (k==='m'){ demo=!demo; reset(false); }
+  if (k===' ' && demo){ e.preventDefault(); S.demoThrust=true; if (S.charge>=T.minChargeToFire && S.phase!=='release') fire(); }
+});
+window.__S = S; // debug
+</script>
+<script src="../shared/clouds.js"></script>
+<script src="../shared/start.js"></script>
+</body>
+</html>

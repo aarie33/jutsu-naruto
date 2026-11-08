@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kuchiyose Detector</title>
+<style>
+  :root { --c:#3ce6aa; --ink:#effff8; }
+  html,body { margin:0; height:100%; background:#040807; overflow:hidden;
+    font-family: ui-sans-serif, -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif; color:var(--ink); }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  video { display:none; }
+  #hud { position:fixed; inset:0; pointer-events:none; }
+  #label { position:absolute; top:5vh; left:0; right:0; text-align:center; font-weight:800; letter-spacing:.14em;
+    font-size:clamp(14px,2.4vw,26px); text-transform:uppercase; text-shadow:0 2px 18px rgba(0,0,0,.85); transition:opacity .25s; }
+  #bar { position:absolute; bottom:6vh; left:50%; transform:translateX(-50%); width:min(46vw,420px); height:8px; border-radius:8px; background:rgba(255,255,255,.12); overflow:hidden; }
+  #fill { height:100%; width:0%; background:linear-gradient(90deg,#0a8f66,var(--c),#fff); box-shadow:0 0 18px var(--c); }
+  #stat { position:absolute; bottom:2vh; left:0; right:0; text-align:center; font-size:12px; opacity:.45; letter-spacing:.1em; }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../shared/start.css">
+</head>
+<body>
+<video id="cam" playsinline muted loop></video>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="label">Memuat…</div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="stat"></div>
+</div>
+<div id="start" style="--accent:#3ce6aa">
+  <div class="st-wrap">
+    <header class="st-head">
+      <h1 class="st-title">Kuchiyose</h1>
+      <p class="st-lede">Panggil katak roh untuk berdiri di sampingmu.</p>
+    </header>
+    <ol class="st-steps"><li><p><b>Buka telapak tangan</b><span>dengan jari terbuka lebar.</span></p></li><li><p><b>Tepuk ke bawah</b><span>dengan cepat, seperti menepuk tanah. Katak muncul di sisi tangan itu.</span></p></li><li><p><b>Tahan telapak terbuka</b><span>ke kamera sebentar untuk memulangkannya.</span></p></li></ol>
+    <div class="st-actions">
+      <div class="st-row">
+        <button id="go" class="st-go" type="button"><span class="st-label">Mulai kamera</span><svg class="st-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><svg class="st-spin" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-opacity=".3" stroke-width="2.5"/><path d="M17.5 10A7.5 7.5 0 0 0 10 2.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></button>
+        
+      </div>
+      <p class="st-privacy"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.5"/></svg>Kamera diproses langsung di perangkatmu. Tidak ada video yang dikirim.</p>
+      <p id="err" role="alert"></p>
+    </div>
+    <footer class="st-keys"><span><kbd>1–3</kbd>warna</span><span><kbd>H</kbd>sembunyikan HUD</span><span><kbd>L</kbd>titik tangan</span><span><kbd>K</kbd>paksa jutsu</span><span><kbd>R</kbd>reset</span><span><kbd>C</kbd>awan</span></footer>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, ImageSegmenter, FaceLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- tunables ----------
+const T = {
+  slapDrop: 0.2,      // tangan harus turun ≥ 20% tinggi layar…
+  slapTime: 0.35,     // …dalam waktu ini (detik)
+  slapLow: 0.5,       // dan berakhir di bawah setengah layar
+  cooldown: 1.6,
+  size: 0.42,         // tinggi katak relatif tinggi layar
+  sideGap: 0.9,       // jarak katak dari wajahmu (× lebar wajah)
+  dismissDrop: 0.12,  // tepukan untuk memulangkan lebih longgar
+  swipe: 0.22,        // atau kibaskan tangan ke samping ≥ 22% lebar layar
+  holdPalm: 0.7,      // atau tahan telapak terbuka diam selama ini (detik)
+  fillAlpha: 0.9,     // kepekatan tubuh katak
+  shade: 0.22,        // kegelapan warna tubuh (0 = hitam)
+  maskLo: 0.35, maskHi: 0.75,
+};
+const PALETTES = {
+  '1': { glow:[60,230,170],  core:[220,255,240], name:'giok'   },
+  '2': { glow:[255,150,40],  core:[255,235,210], name:'jingga' },
+  '3': { glow:[160,90,255],  core:[240,225,255], name:'ungu'   },
+};
+const params = new URLSearchParams(location.search);
+let PAL = PALETTES[params.get('c')] || PALETTES['1'];
+const TS = +params.get('ts') || 1;
+const rgba = (c,a)=>`rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const clamp01 = v => Math.max(0, Math.min(1, v));
+const ease = v => v*v*(3-2*v);
+const easeOut = v => 1-Math.pow(1-v,3);
+const easeOutBack = v => { const c=1.6; return 1 + (c+1)*Math.pow(v-1,3) + c*Math.pow(v-1,2); };
+
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const video=document.getElementById('cam');
+const $label=document.getElementById('label'), $stat=document.getElementById('stat'), $fill=document.getElementById('fill');
+let W=0,H=0,DPR=1;
+const off = () => { const c=document.createElement('canvas'); return [c, c.getContext('2d')]; };
+const L = {}; for (const k of ['sk','skT','body','bodyD','bodyT']) { const [c,x]=off(); L[k]={c,x}; }
+const [cutC,cutX]=off(), [maskC,maskX0]=off();
+function resize(){ DPR=1; W=innerWidth; H=innerHeight; cv.width=W*DPR; cv.height=H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0);
+  for (const k in L){ L[k].c.width=Math.round(W/2); L[k].c.height=Math.round(H/2); } }
+addEventListener('resize',resize); resize();
+
+let hands=null, seg=null, face=null, showHud=true, showLm=false, running=false;
+
+// ---------- audio (disintesis) ----------
+let A=null;
+function initAudio(){
+  if (A) return;
+  const ac=new (window.AudioContext||window.webkitAudioContext)();
+  const master=ac.createGain(); master.gain.value=0.9; master.connect(ac.destination);
+  const buf=ac.createBuffer(1,ac.sampleRate*2,ac.sampleRate), d=buf.getChannelData(0); for (let i=0;i<d.length;i++) d[i]=Math.random()*2-1;
+  const o=ac.createOscillator(); o.type='sine'; o.frequency.value=48;
+  const hum=ac.createGain(); hum.gain.value=0; o.connect(hum); hum.connect(master); o.start();
+  A={ac,master,buf,hum};
+}
+const noise = (t, len, type, f0, f1, vol, q=1) => { const ac=A.ac, n=ac.createBufferSource(); n.buffer=A.buf; const f=ac.createBiquadFilter(); f.type=type; f.Q.value=q;
+  f.frequency.setValueAtTime(f0,t); f.frequency.exponentialRampToValueAtTime(f1,t+len);
+  const g=ac.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+len); n.connect(f); f.connect(g); g.connect(A.master); n.start(t); n.stop(t+len+0.05); };
+const tone = (t, len, type, f0, f1, vol) => { const ac=A.ac, o=ac.createOscillator(); o.type=type; o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(f1,t+len);
+  const g=ac.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+len); o.connect(g); g.connect(A.master); o.start(t); o.stop(t+len+0.05); };
+function sfxSlap(){ if (!A) return; const t=A.ac.currentTime; tone(t,0.35,'sine',90,40,0.9); noise(t,0.12,'lowpass',2500,300,0.6); }
+function sfxRune(){ if (!A) return; const t=A.ac.currentTime; tone(t,1.0,'sine',660,990,0.12); tone(t+0.05,1.0,'sine',990,1320,0.08); }
+function sfxPoof(){ if (!A) return; const t=A.ac.currentTime; noise(t,0.8,'bandpass',1200,180,0.9,0.7); tone(t,0.4,'sine',140,50,0.5); }
+function sfxLand(){ if (!A) return; const t=A.ac.currentTime; tone(t,0.9,'sine',70,28,1.0); noise(t,0.6,'lowpass',1200,100,0.6); }
+function sfxCroak(){ if (!A) return; const ac=A.ac, t=ac.currentTime;   // dua "krok" dalam
+  for (const [dt,len] of [[0,0.32],[0.42,0.48]]){ const o=ac.createOscillator(); o.type='sawtooth'; o.frequency.setValueAtTime(95,t+dt); o.frequency.linearRampToValueAtTime(78,t+dt+len);
+    const am=ac.createOscillator(); am.frequency.value=34; const amg=ac.createGain(); amg.gain.value=0.5; am.connect(amg);
+    const lp=ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=650; lp.Q.value=4;
+    const g=ac.createGain(); g.gain.setValueAtTime(0.0001,t+dt); g.gain.exponentialRampToValueAtTime(0.7,t+dt+0.04); g.gain.setValueAtTime(0.7,t+dt+len*0.7); g.gain.exponentialRampToValueAtTime(0.001,t+dt+len);
+    amg.connect(g.gain); o.connect(lp); lp.connect(g); g.connect(A.master); o.start(t+dt); am.start(t+dt); o.stop(t+dt+len+0.05); am.stop(t+dt+len+0.05); } }
+function audioLevel(I){ if (!A) return; A.hum.gain.setTargetAtTime(0.12*I, A.ac.currentTime, 0.2); }
+
+// ---------- tracking ----------
+let cover={s:1,ox:0,oy:0,dw:1,dh:1,vw:1280,vh:720};
+function computeCover(){ const vw=video.videoWidth||1280, vh=video.videoHeight||720, s=Math.max(W/vw,H/vh);
+  cover={s,vw,vh,dw:vw*s,dh:vh*s,ox:(W-vw*s)/2,oy:(H-vh*s)/2}; }
+const toScreen = l => ({ x:cover.ox+(1-l.x)*cover.dw, y:cover.oy+l.y*cover.dh });
+const FINGERS=[[8,6],[12,10],[16,14],[20,18]], PALM=[0,5,9,13,17];
+function analyseHand(lms){
+  const {vw,vh}=cover, p3=i=>({x:lms[i].x*vw,y:lms[i].y*vh,z:lms[i].z*vw}), d3=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);
+  const w=p3(0), ext=FINGERS.map(([t,p])=>d3(w,p3(t))>d3(w,p3(p))*1.12);
+  const pts=lms.map(toScreen); let cx=0, cy=0; for (const i of PALM){ cx+=pts[i].x; cy+=pts[i].y; }
+  return { pts, ext, cx:cx/5, cy:cy/5, size:Math.hypot(pts[0].x-pts[9].x, pts[0].y-pts[9].y), open: ext.filter(Boolean).length>=3 };
+}
+let F=null;
+function analyseFace(lms){ const P=i=>toScreen(lms[i]); const a=P(468), b=P(473);
+  return { eyeY:(a.y+b.y)/2, x:(a.x+b.x)/2, fw:Math.hypot(P(234).x-P(454).x, P(234).y-P(454).y) }; }
+
+// deteksi tepukan: telapak terbuka bergerak cepat ke bawah
+const hist=[]; let lastHand=null;
+let slapX=null;
+function detectSlap(hs, now, relaxed){
+  const drop = relaxed ? T.dismissDrop : T.slapDrop, low = relaxed ? 0.35 : T.slapLow;
+  const h = hs.filter(h=>h.open).sort((a,b)=>b.size-a.size)[0] || null;
+  if (h){ hist.push({ t:now, y:h.cy, x:h.cx }); lastHand={ t:now, y:h.cy, x:h.cx }; }
+  while (hist.length && now-hist[0].t > T.slapTime*1000) hist.shift();
+  if (h && hist.length>2){ const o=hist[0];
+    if (now-o.t>80 && (h.cy-o.y)>drop*H && h.cy>low*H) { slapX=h.cx; hist.length=0; return true; }
+    if (relaxed && now-o.t>80 && Math.abs(h.cx-o.x)>T.swipe*W) { slapX=h.cx; hist.length=0; return true; } }
+  // tangan keluar dari bawah layar saat bergerak turun
+  if (!h && lastHand && now-lastHand.t<150 && hist.length>2){ const o=hist[0]; if ((lastHand.y-o.y)>drop*H*0.7 && lastHand.y>0.6*H){ slapX=lastHand.x; hist.length=0; lastHand=null; return true; } }
+  return false;
+}
+
+// ---------- katak roh (desain orisinal) ----------
+// satuan g, origin = tengah dasar, y ke atas negatif
+function bez(p0,p1,p2,p3,n=20){ const o=[]; for(let i=0;i<=n;i++){ const t=i/n,m=1-t;
+  o.push([m*m*m*p0[0]+3*m*m*t*p1[0]+3*m*t*t*p2[0]+t*t*t*p3[0], m*m*m*p0[1]+3*m*m*t*p1[1]+3*m*t*t*p2[1]+t*t*t*p3[1]]); } return o; }
+function ell(cx,cy,rx,ry,a0=0,a1=Math.PI*2,n=36){ const o=[]; for(let i=0;i<=n;i++){ const a=a0+(a1-a0)*i/n; o.push([cx+Math.cos(a)*rx, cy+Math.sin(a)*ry]); } return o; }
+const mir = pts => pts.map(([x,y])=>[-x,y]);
+const R_SIDE=[[0,-9.05],[1.4,-9.3],[2.5,-9.15],[4.4,-8.55],[5.7,-7.4],[6.4,-6.0],[6.9,-4.0],[7.1,-2.0],[7.3,0.4]];
+const BODY = mir(R_SIDE).reverse().concat(R_SIDE.slice(1));
+const ARM_R = [[3.6,-5.0],[4.9,-4.7],[5.3,-2.5],[5.75,-0.5],[4.3,-0.35],[4.05,-2.3]];
+const TOES = s => [3.75,4.75,5.75].map((x,i)=>ell(s*x,-0.12-(i===1?0.12:0),0.58,0.36,0,Math.PI*2,20));
+const EYES = [-1,1].map(s=>({ x:s*3.3, y:-9.55, r:1.75 }));
+const mouthY = (x, open=0) => -6.0 - 0.65*Math.pow(Math.abs(x)/5.8,2) + open*0.9*(1-Math.pow(Math.abs(x)/5.8,2));
+const MARKS = [
+  ...[0,1,2].map(i=>[[-1.15+i*0.15,-8.55+i*0.45],[0,-8.0+i*0.45],[1.15-i*0.15,-8.55+i*0.45]]),        // chevron dahi
+  ...[-1,1].flatMap(s=>[ell(s*5.0,-6.95,0.5,0.42,0,Math.PI*1.6,16), ell(s*5.0,-6.95,0.22,0.18,0,Math.PI*1.6,10)]),  // pusaran pipi
+  ...[-1,1].flatMap(s=>[[[s*4.15,-3.4],[s*5.05,-3.6]],[[s*4.3,-2.6],[s*5.25,-2.8]]]),                 // gelang lengan
+  ...[-1,1].map(s=>bez([s*1.6,-9.0],[s*2.2,-7.6],[s*3.6,-7.4],[s*4.6,-7.9])),                          // garis kepala
+];
+// bintil acak (seed tetap)
+const rnd=(()=>{ let a=7; return ()=>{ a|=0; a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; })();
+const WARTS=[]; while (WARTS.length<26){ const x=-6.2+rnd()*12.4, y=-8.4+rnd()*7.0;
+  if ((x*x)/(6.6*6.6)+((y+4.2)*(y+4.2))/(5*5)>1) continue; if ((x*x)/(3.8*3.8)+((y+2.6)*(y+2.6))/(3*3)<1) continue;
+  if (Math.abs(y-mouthY(x))<0.55) continue; if (EYES.some(e=>Math.hypot(x-e.x,y-e.y)<2.1)) continue; if (Math.abs(x)>3.4&&Math.abs(x)<5.6&&y>-5) continue;
+  WARTS.push([x,y,0.14+rnd()*0.22]); }
+
+// transform katak → layar
+let K={ cx:0, by:0, g:40, sx:1, sy:1, rise:0 };
+const TX = p => [K.cx + p[0]*K.g*K.sx, K.by + p[1]*K.g*K.sy + K.rise];
+function path(x2, pts, closed=true, smooth=true){
+  const q=pts.map(TX); x2.beginPath();
+  if (!smooth || !closed){ q.forEach((p,i)=>i?x2.lineTo(p[0],p[1]):x2.moveTo(p[0],p[1])); if (closed) x2.closePath(); return; }
+  const n=q.length, mid=(a,b)=>[(a[0]+b[0])/2,(a[1]+b[1])/2]; let m=mid(q[n-1],q[0]); x2.moveTo(m[0],m[1]);
+  for (let i=0;i<n;i++){ const c=q[i], nx=mid(c,q[(i+1)%n]); x2.quadraticCurveTo(c[0],c[1],nx[0],nx[1]); } x2.closePath(); }
+function partial(pts, r){ return pts.slice(0, Math.max(2, Math.ceil(pts.length*r))); }
+// gambar katak ke layer: sk = garis menyala, body = isi
+function drawToad(draw, fillK, mouthOpen){
+  const sk=L.sk.x, bd=L.body.x; sk.lineCap=sk.lineJoin='round';
+  // isi
+  if (fillK>0){ bd.globalAlpha=fillK;
+    for (const s of [-1,1]){ path(bd, ell(s*6.9,-1.3,1.75,1.4)); bd.fill(); }
+    path(bd, BODY); bd.fill();
+    for (const s of [-1,1]){ path(bd, s>0?ARM_R:mir(ARM_R)); bd.fill(); for (const t of TOES(s)){ path(bd,t); bd.fill(); } }
+    for (const e of EYES){ path(bd, ell(e.x,e.y,e.r,e.r*0.92)); bd.fill(); }
+    bd.globalAlpha=1; }
+  // garis (digambar bertahap saat muncul)
+  sk.lineWidth=0.13*K.g;
+  const strokeP = (pts, closed) => { path(sk, partial(closed?pts.concat([pts[0]]):pts, draw), false, false); sk.stroke(); };
+  strokeP(BODY, true);
+  for (const s of [-1,1]){ strokeP(ell(s*6.9,-1.3,1.75,1.4,Math.PI*(s>0?1.25:-0.25),Math.PI*(s>0?2.6:1.1)), false); strokeP(s>0?ARM_R:mir(ARM_R), true); for (const t of TOES(s)) strokeP(t, true); }
+  for (const e of EYES) strokeP(ell(e.x,e.y,e.r,e.r*0.92), true);
+  // mulut
+  sk.lineWidth=0.16*K.g; const up=[], lo=[]; for (let i=0;i<=24;i++){ const x=-5.8+11.6*i/24; up.push([x,mouthY(x)]); lo.push([x,mouthY(x,mouthOpen)]); }
+  strokeP(up,false); if (mouthOpen>0.02) strokeP(lo,false);
+  // corak & bintil
+  if (draw>0.6){ const a=(draw-0.6)/0.4; sk.globalAlpha=a; sk.lineWidth=0.09*K.g;
+    for (const m of MARKS){ path(sk,m,false); sk.stroke(); }
+    for (const [x,y,r] of WARTS){ path(sk, ell(x,y,r,r*0.85,0,Math.PI*2,10)); sk.stroke(); }
+    for (const s of [-1,1]){ path(sk, ell(s*0.6,-8.0,0.16,0.1,0,Math.PI*2,10)); sk.stroke(); }
+    sk.globalAlpha=1; }
+  return { up, lo };
+}
+function drawEyes(open, look, t){ // iris emas + pupil celah horizontal
+  if (open<=0.01) return;
+  for (const e of EYES){ const [X,Y]=TX([e.x+look[0]*0.25, e.y-0.05+look[1]*0.15]), R=1.2*K.g, ry=R*open;
+    ctx.save(); ctx.globalCompositeOperation='lighter';
+    let g=ctx.createRadialGradient(X,Y,0,X,Y,R*2.2); g.addColorStop(0,`rgba(255,200,60,${0.5*open})`); g.addColorStop(1,'rgba(255,160,20,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(X,Y,R*2.2,0,7); ctx.fill();
+    g=ctx.createRadialGradient(X,Y-ry*0.3,0,X,Y,R); g.addColorStop(0,'rgba(255,245,180,1)'); g.addColorStop(0.6,'rgba(255,190,50,1)'); g.addColorStop(1,'rgba(200,110,10,1)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.ellipse(X,Y,R,ry,0,0,7); ctx.fill(); ctx.restore();
+    ctx.fillStyle='#050302'; ctx.beginPath(); ctx.ellipse(X+look[0]*R*0.15, Y, R*0.72, Math.max(0.5,R*0.2*open), 0, 0, 7); ctx.fill(); }
+}
+
+// ---------- lingkaran segel (desain orisinal) ----------
+const GLYPHS = Array.from({length:28}, ()=>{ const n=2+Math.floor(rnd()*3), segs=[]; for (let i=0;i<n;i++) segs.push([[rnd()-0.5,rnd()-0.5],[rnd()-0.5,rnd()-0.5]]); return segs; });
+function drawCircle(k, fade, t){
+  if (k<=0||fade<=0) return; const cx=K.cx, cy=K.by-0.15*K.g, rx=K.g*8.2, ry=rx*0.2, rot=t*0.25;
+  ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.lineCap='round'; ctx.shadowColor=rgba(PAL.glow,1); ctx.shadowBlur=14;
+  const col=a=>rgba(PAL.core, a*fade), glow=a=>rgba(PAL.glow, a*fade);
+  const ring=(r,w,from,len,a)=>{ ctx.strokeStyle=glow(a); ctx.lineWidth=w; ctx.beginPath(); ctx.ellipse(cx,cy,rx*r,ry*r,0,from,from+len); ctx.stroke(); };
+  const d=easeOut(clamp01(k/0.6));
+  ring(1.0, 4, rot, Math.PI*2*d, 0.9); ring(0.86, 2.5, -rot, Math.PI*2*d, 0.8); ring(0.5, 2.5, rot*1.5, Math.PI*2*d, 0.75);
+  // bintang 8 sudut dari dua persegi
+  if (k>0.35){ const a=clamp01((k-0.35)/0.3); ctx.strokeStyle=glow(0.7*a); ctx.lineWidth=2;
+    for (const off of [0, Math.PI/4]){ ctx.beginPath(); for (let i=0;i<=4;i++){ const an=off+i*Math.PI/2+rot*0.6; const X=cx+Math.cos(an)*rx*0.5, Y=cy+Math.sin(an)*ry*0.5; i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); } ctx.stroke(); }
+    for (let i=0;i<8;i++){ const an=i*Math.PI/4-rot*0.4; ctx.beginPath(); ctx.moveTo(cx+Math.cos(an)*rx*0.5, cy+Math.sin(an)*ry*0.5); ctx.lineTo(cx+Math.cos(an)*rx*0.86, cy+Math.sin(an)*ry*0.86); ctx.stroke(); } }
+  // huruf rune di pita luar
+  if (k>0.5){ const a=clamp01((k-0.5)/0.4); ctx.strokeStyle=col(0.85*a); ctx.lineWidth=1.6;
+    GLYPHS.forEach((gl,i)=>{ if (i/GLYPHS.length>a) return; const an=i/GLYPHS.length*Math.PI*2+rot, X=cx+Math.cos(an)*rx*0.93, Y=cy+Math.sin(an)*ry*0.93, s=rx*0.05;
+      for (const [p,q] of gl){ ctx.beginPath(); ctx.moveTo(X+p[0]*s, Y+p[1]*s*0.5); ctx.lineTo(X+q[0]*s, Y+q[1]*s*0.5); ctx.stroke(); } }); }
+  // cahaya naik dari lingkaran
+  const g=ctx.createLinearGradient(0,cy,0,cy-H*0.5); g.addColorStop(0,glow(0.28*d)); g.addColorStop(1,glow(0));
+  ctx.shadowBlur=0; ctx.fillStyle=g; ctx.fillRect(cx-rx, cy-H*0.5, rx*2, H*0.5);
+  ctx.restore();
+}
+
+// ---------- sprite pra-render (digambar sekali, dipakai ulang tiap frame) ----------
+let SPR=null;
+function buildToadSprite(g0){
+  const w=Math.ceil(17*g0), h=Math.ceil(13.2*g0), ox=w/2, oy=h-0.8*g0;
+  const mk=()=>{ const [c,x]=off(); c.width=w; c.height=h; return {c,x}; };
+  const B=mk(), Sk=mk(), saveL={sk:L.sk, body:L.body}, saveK=K;
+  L.sk=Sk; L.body=B; K={ cx:ox, by:oy, g:g0, sx:1, sy:1, rise:0 };
+  B.x.fillStyle='#fff'; Sk.x.strokeStyle=Sk.x.fillStyle='#fff';
+  drawToad(1, 1, 0);
+  L.sk=saveL.sk; L.body=saveL.body; K=saveK;
+  const tint=(src,col)=>{ const o=mk(); o.x.drawImage(src.c,0,0); o.x.globalCompositeOperation='source-in'; o.x.fillStyle=col; o.x.fillRect(0,0,w,h); return o; };
+  const dark=tint(B, rgba(PAL.glow.map(v=>Math.round(v*T.shade)),1));
+  const glowB=tint(B, rgba(PAL.glow,1)), glowS=tint(Sk, rgba(PAL.glow,1)), glow=mk(), k=g0/40;
+  glow.x.globalCompositeOperation='lighter';
+  glow.x.globalAlpha=0.35; glow.x.filter=`blur(${22*k}px)`; glow.x.drawImage(glowB.c,0,0);
+  glow.x.globalAlpha=0.9;  glow.x.filter=`blur(${12*k}px)`; glow.x.drawImage(glowS.c,0,0);
+  glow.x.globalAlpha=0.85; glow.x.filter=`blur(${3*k}px)`;  glow.x.drawImage(glowS.c,0,0);
+  glow.x.globalAlpha=0.5;  glow.x.filter='none'; glow.x.drawImage(Sk.c,0,0);
+  return { g0, w, h, ox, oy, pal:PAL.name, dark:dark.c, glow:glow.c };
+}
+let CSPR=null;
+function buildCircleSprite(){
+  const R=260, pad=40, n=2*(R+pad), [c,x]=off(); c.width=c.height=n; const cx=n/2, cy=n/2;
+  x.lineCap='round'; x.shadowColor=rgba(PAL.glow,1); x.shadowBlur=18;
+  const ring=(r,w,a)=>{ x.strokeStyle=rgba(PAL.glow,a); x.lineWidth=w; x.beginPath(); x.arc(cx,cy,R*r,0,7); x.stroke(); };
+  ring(1.0,7,0.95); ring(0.86,4,0.85); ring(0.5,4,0.8);
+  x.strokeStyle=rgba(PAL.glow,0.75); x.lineWidth=3.5;
+  for (const o of [0, Math.PI/4]){ x.beginPath(); for (let i=0;i<=4;i++){ const a=o+i*Math.PI/2; const X=cx+Math.cos(a)*R*0.5, Y=cy+Math.sin(a)*R*0.5; i?x.lineTo(X,Y):x.moveTo(X,Y); } x.stroke(); }
+  for (let i=0;i<8;i++){ const a=i*Math.PI/4; x.beginPath(); x.moveTo(cx+Math.cos(a)*R*0.5, cy+Math.sin(a)*R*0.5); x.lineTo(cx+Math.cos(a)*R*0.86, cy+Math.sin(a)*R*0.86); x.stroke(); }
+  x.strokeStyle=rgba(PAL.core,0.9); x.lineWidth=3;
+  GLYPHS.forEach((gl,i)=>{ const a=i/GLYPHS.length*Math.PI*2, X=cx+Math.cos(a)*R*0.93, Y=cy+Math.sin(a)*R*0.93, sz=R*0.075;
+    x.save(); x.translate(X,Y); x.rotate(a+Math.PI/2); for (const [p,q] of gl){ x.beginPath(); x.moveTo(p[0]*sz,p[1]*sz); x.lineTo(q[0]*sz,q[1]*sz); x.stroke(); } x.restore(); });
+  return { c, R, n, pal:PAL.name };
+}
+function drawCircleFast(k, fade, t){
+  if (k<=0||fade<=0) return; if (!CSPR || CSPR.pal!==PAL.name) CSPR=buildCircleSprite();
+  const cx=K.cx, cy=K.by-0.15*K.g, rx=K.g*7.4, d=easeOut(clamp01(k/0.6)), sc=rx/CSPR.R*(0.6+0.4*d);
+  ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.globalAlpha=fade*Math.min(1,k*1.6);
+  ctx.translate(cx,cy); ctx.scale(1,0.2); ctx.rotate(t*0.25); ctx.scale(sc,sc); ctx.drawImage(CSPR.c,-CSPR.n/2,-CSPR.n/2); ctx.restore();
+  ctx.save(); ctx.globalCompositeOperation='lighter'; const g=ctx.createLinearGradient(0,cy,0,cy-H*0.45); g.addColorStop(0,rgba(PAL.glow,0.25*d*fade)); g.addColorStop(1,rgba(PAL.glow,0));
+  ctx.fillStyle=g; ctx.fillRect(cx-rx, cy-H*0.45, rx*2, H*0.45); ctx.restore();
+}
+
+// ---------- katak realistis (assets/toad.png) ----------
+// titik penting di gambar 1224×1285: dasar kaki, mata, tenggorokan
+const TI = { w:1224, h:1285, baseX:612, baseY:1224, bodyH:1173, halfW:600, eyes:[[434,156],[780,157]], eyeR:24, throat:[612,430] };
+const TIMG={};
+function loadTI(k, src){ return new Promise((res,rej)=>{ const i=new Image(); i.onload=()=>{ TIMG[k]=i; res(); }; i.onerror=rej; i.src=src; }); }
+let TGLOW=null;   // siluet berpendar (dibuat sekali per warna)
+function buildToadGlow(){ const [c,x]=off(), sc=0.5; c.width=TI.w*sc; c.height=TI.h*sc;
+  x.drawImage(TIMG.toad,0,0,c.width,c.height); x.globalCompositeOperation='source-in'; x.fillStyle=rgba(PAL.glow,1); x.fillRect(0,0,c.width,c.height);
+  const [c2,x2]=off(); c2.width=c.width; c2.height=c.height; x2.filter='blur(14px)'; x2.drawImage(c,0,0); return { c:c2, sc, pal:PAL.name }; }
+const HUE_EM = { giok:0, jingga:-110, ungu:130 };
+
+// ---------- asap ----------
+const smokeSpr=(()=>{ const [c,x]=off(); c.width=c.height=128; const g=x.createRadialGradient(64,64,0,64,64,64);
+  g.addColorStop(0,'rgba(255,255,255,1)'); g.addColorStop(0.45,'rgba(235,240,238,.55)'); g.addColorStop(1,'rgba(220,225,222,0)'); x.fillStyle=g; x.fillRect(0,0,128,128); return c; })();
+const smoke=[];
+function puffBig(){ const cx=K.cx, cy=K.by-2*K.g, rx=K.g*8.5;
+  for (let i=0;i<110;i++){ const a=Math.random()*Math.PI*2, d=Math.sqrt(Math.random());
+    const x=cx+Math.cos(a)*rx*d, y=cy+Math.sin(a)*rx*0.2*d, size=rx*(0.12+Math.random()*0.16);
+    smoke.push({ x, y, vx:(x-cx)*0.6+(Math.random()-0.5)*size, vy:-(K.g*3+Math.random()*K.g*8), r:size, gr:size*(1.2+Math.random()), age:0, life:1.1+Math.random()*0.9 }); } }
+
+// asap "poof" kartun (orisinal): gumpalan bertepi tegas, bayangan bawah, kilau atas; muncul menghentak lalu menyusut
+function celSmoke(L){
+  const pass=(sc,dx,dy,col)=>{ ctx.fillStyle=col; ctx.beginPath(); for (const q of L){ const r=q.r*sc; if (r<1) continue; const x=q.x+dx*q.r, y=q.y+dy*q.r; ctx.moveTo(x+r,y); ctx.arc(x,y,r,0,7); } ctx.fill(); };
+  ctx.save(); ctx.globalAlpha=1;
+  pass(1.08, 0, 0.03, '#7c8590');     // tepi abu
+  pass(1.0, 0.05, 0.1, '#b9c2cc');    // bayangan bawah
+  pass(0.88,-0.04,-0.07,'#eef2f6');   // badan asap
+  pass(0.42,-0.28,-0.32,'#ffffff');   // kilau
+  // garis lengkung kecil di sebagian gumpalan
+  ctx.strokeStyle='#8d96a1'; ctx.lineCap='round';
+  for (const q of L){ if (q.id%11!==0 || q.r<28) continue; ctx.lineWidth=Math.max(1.5,q.r*0.07); ctx.beginPath(); ctx.arc(q.x+q.r*0.15,q.y+q.r*0.1,q.r*0.45,0.2*Math.PI,0.85*Math.PI); ctx.stroke(); }
+  ctx.restore();
+}
+let smokeId=0;
+function drawSmoke(dt){
+  const LS=[];
+  for (let i=smoke.length-1;i>=0;i--){ const p=smoke[i]; p.age+=dt; if (p.age>p.life){ smoke.splice(i,1); continue; }
+    const k=p.age/p.life; p.vx*=Math.pow(0.08,dt); p.vy*=Math.pow(0.15,dt); p.x+=p.vx*dt; p.y+=p.vy*dt; p.r+=p.gr*dt*(1-k);
+    if (p.id==null) p.id=smokeId++; const pop = k<0.12 ? 0.55+0.45*(k/0.12)*1.08 : 1, shrink = k>0.65 ? Math.max(0,1-(k-0.65)/0.35) : 1;
+    LS.push({ x:p.x, y:p.y, r:p.r*pop*shrink, id:p.id }); }
+  celSmoke(LS);
+  ctx.globalAlpha=1;
+}
+
+// ---------- mask / cutout ----------
+let maskImg=null, hasPerson=false;
+function onMask(mask){
+  const mw=mask.width, mh=mask.height, conf=mask.getAsFloat32Array();
+  if (maskC.width!==mw||maskC.height!==mh){ maskC.width=mw; maskC.height=mh; maskImg=maskX0.createImageData(mw,mh); }
+  const px=maskImg.data, lo=T.maskLo, span=T.maskHi-T.maskLo; let n=0;
+  for (let i=0,j=0;i<conf.length;i++,j+=4){ const a=clamp01((conf[i]-lo)/span); px[j]=px[j+1]=px[j+2]=255; px[j+3]=a*255; if (a>0.5) n++; }
+  maskX0.putImageData(maskImg,0,0); hasPerson=n>200;
+  const k=Math.min(1,960/cover.vw); const cw=Math.round(cover.vw*k), ch=Math.round(cover.vh*k);
+  if (cutC.width!==cw){ cutC.width=cw; cutC.height=ch; }
+  cutX.globalCompositeOperation='copy'; cutX.drawImage(video,0,0,cw,ch);
+  cutX.globalCompositeOperation='destination-in'; cutX.filter='blur(1.5px)'; cutX.drawImage(maskC,0,0,cw,ch); cutX.filter='none'; cutX.globalCompositeOperation='source-over';
+}
+function drawMirrored(x2, src){ x2.save(); x2.translate(cover.ox+cover.dw, cover.oy); x2.scale(-1,1); x2.drawImage(src,0,0,cover.dw,cover.dh); x2.restore(); }
+
+// ---------- layer helpers ----------
+function prepLayer(l){ l.x.setTransform(1,0,0,1,0,0); l.x.clearRect(0,0,l.c.width,l.c.height); l.x.setTransform(0.5,0,0,0.5,0,0); }
+function tintTo(src, dst, col){ dst.x.setTransform(1,0,0,1,0,0); dst.x.globalCompositeOperation='copy'; dst.x.drawImage(src.c,0,0);
+  dst.x.globalCompositeOperation='source-in'; dst.x.fillStyle=col; dst.x.fillRect(0,0,dst.c.width,dst.c.height); dst.x.globalCompositeOperation='source-over'; }
+function blit(l, alpha, blur){ if (alpha<=0.003) return; ctx.globalAlpha=alpha; ctx.filter=blur?`blur(${blur}px)`:'none'; ctx.drawImage(l.c,0,0,W,H); ctx.filter='none'; ctx.globalAlpha=1; }
+
+// ---------- state ----------
+const S={ on:false, cool:0, t:0, t0:-99, tOff:-99, ev:{}, blinkAt:0 };
+window.__S=S;
+function once(key, fn){ if (!S.ev[key]){ S.ev[key]=true; fn(); } }
+let shake=0, flash=0;
+function toggle(){ S.cool=T.cooldown; sfxSlap(); shake=Math.max(shake,0.4);
+  if (!S.on){ S.on=true; S.t0=S.t; S.ev={}; S.nextBlink=0; S.blinkAt=0; const fx=F?F.x:W/2; S.side = slapX!=null ? (slapX<fx?-1:1) : 1; S.cx=null; sfxRune(); } else { S.on=false; S.tOff=S.t; sfxPoof(); puffBig(); } }
+
+// ---------- loop ----------
+let last=performance.now(), lastVid=-1, hs=[], fpsAcc=0,fpsN=0,fps=0, anc=null, vf=0;
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000)*TS; last=now; S.t+=dt; const t=S.t;
+  fpsAcc+=dt/TS; fpsN++; if (fpsAcc>0.5){ fps=Math.round(fpsN/fpsAcc); fpsAcc=0; fpsN=0; }
+  let slap=false;
+  if (video.readyState>=2 && video.currentTime!==lastVid){
+    lastVid=video.currentTime; computeCover();
+    if (hands){ hs=(hands.detectForVideo(video,now).landmarks||[]).map(analyseHand); slap=detectSlap(hs, now, S.on); }
+    if (face && (vf++%3===0)){ const r=face.detectForVideo(video,now); F=r.faceLandmarks?.[0]?analyseFace(r.faceLandmarks[0]):null; }
+    if (seg) seg.segmentForVideo(video,now,res=>{ const m=res.confidenceMasks?.[0]; if (m) onMask(m); });
+  }
+  // telapak terbuka yang diam (untuk memulangkan)
+  const ph = hs.filter(h=>h.open).sort((a,b)=>b.size-a.size)[0];
+  if (S.on && t-S.t0>2.0 && ph){ const p0=S.palmRef; if (p0 && Math.hypot(ph.cx-p0.x, ph.cy-p0.y) < 0.06*H) S.palmHold+=dt; else { S.palmRef={x:ph.cx,y:ph.cy}; S.palmHold=0; } }
+  else { S.palmHold=Math.max(0,(S.palmHold||0)-dt*2); S.palmRef=null; }
+  if (S.cool>0) S.cool-=dt;
+  else if (slap && (!S.on || t-S.t0>2.0)) toggle();
+  else if (S.on && S.palmHold>=T.holdPalm){ S.palmHold=0; toggle(); }
+
+  // timeline
+  const since=t-S.t0, out=t-S.tOff;
+  const circleK = S.on ? clamp01(since/1.0) : 1, circleFade = S.on ? 1 : clamp01(1-out/0.9);
+  if (S.on && since>0.55) once('poof', ()=>{ sfxPoof(); puffBig(); flash=0.25; });
+  const riseK = S.on ? clamp01((since-0.6)/0.8) : 1;
+  const draw = S.on ? easeOut(clamp01((since-0.65)/0.7)) : 1;
+  const fillK = (S.on ? ease(clamp01((since-0.75)/0.5)) : clamp01(1-out/0.45));
+  const I = S.on ? clamp01((since-0.55)/0.3) : clamp01(1-out/0.5);
+  if (S.on && riseK>=1) once('land', ()=>{ sfxLand(); shake=0.8; });
+  // napas, mendarat (squash), krok
+  const land = S.on ? since-1.4 : 99;
+  let sq = land>0 && land<0.6 ? Math.sin(land/0.6*Math.PI)*0.1*(1-land/0.6) : 0;
+  const croakT = S.on ? since-2.3 : -1;
+  let mouthOpen=0, croakSq=0;
+  if (croakT>0 && croakT<1.0){ once('croak', ()=>{ sfxCroak(); shake=Math.max(shake,0.5); });
+    const c = croakT<0.32 ? Math.sin(croakT/0.32*Math.PI) : croakT>0.42&&croakT<0.9 ? Math.sin((croakT-0.42)/0.48*Math.PI) : 0;
+    mouthOpen=0.9*c; croakSq=0.05*c; }
+  const breath = 0.012*Math.sin(t*1.6);
+  // mata: buka, kedip acak
+  let eyeOpen = S.on ? ease(clamp01((since-1.75)/0.3)) : clamp01(1-out/0.3);
+  if (S.on && since>2.2 && !S.nextBlink) S.nextBlink=t+1.5;
+  if (S.on && S.nextBlink && t>S.nextBlink){ S.blinkAt=t; S.nextBlink=t+2.5+Math.random()*3; }
+  const bl = S.blinkAt ? t-S.blinkAt : 9; if (bl<0.22) eyeOpen*=Math.abs(bl/0.11-1);
+  // ukuran/posisi: katak kecil berdiri di samping
+  const by = H*0.975, g = T.size*H/11.5, half = T.size*H*TI.halfW/TI.bodyH;
+  const fx = F ? F.x : W/2, fw = F ? F.fw : W*0.15;
+  if (S.cx==null || !S.on){ const want = fx + (S.side||1)*(fw*T.sideGap + half); if (S.cx==null) S.cx=want; }
+  S.cx = Math.max(half*0.55, Math.min(W-half*0.55, S.cx));  const riseOff = S.on ? (1-easeOutBack(riseK))*H*0.9 : easeOut(clamp01(out/0.5))*H*0.5;
+  K = { cx:S.cx, by, g, sx:1+sq*0.6-croakSq*0.3+breath*0.5, sy:1-sq+croakSq+breath, rise:riseOff };
+  const look = [ Math.max(-1,Math.min(1,(fx-K.cx)/(W*0.35))), 0 ];
+  audioLevel(I);
+
+  // ---- render ----
+  ctx.save();
+  if (shake>0){ const m=shake*14; ctx.translate((Math.random()-0.5)*m,(Math.random()-0.5)*m); shake=Math.max(0,shake-dt*1.8); }
+  ctx.fillStyle='#000'; ctx.fillRect(-30,-30,W+60,H+60);
+  if (video.readyState>=2){
+    drawMirrored(ctx, video);
+    const dim = Math.max(I, S.on ? clamp01(since/0.5)*0.6 : circleFade*0.6);
+    if (dim>0){ ctx.fillStyle=`rgba(2,10,8,${0.4*dim})`; ctx.fillRect(-30,-30,W+60,H+60); }
+    drawCircleFast(circleK, circleFade, t);
+    if (I>0){
+      if (!TGLOW || TGLOW.pal!==PAL.name) TGLOW=buildToadGlow();
+      const s0=T.size*H/TI.bodyH, hf=HUE_EM[PAL.name]?`hue-rotate(${HUE_EM[PAL.name]}deg)`:'none';
+      const pulse=0.55+0.45*Math.sin(t*2.6)*Math.sin(t*1.1+0.7);
+      ctx.save(); ctx.translate(K.cx, K.by+K.rise); ctx.scale(s0*K.sx, s0*K.sy); ctx.translate(-TI.baseX, -TI.baseY);
+      // pendar di belakang
+      ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.globalAlpha=0.45*I*(0.8+0.2*pulse); ctx.drawImage(TGLOW.c,0,0,TI.w,TI.h); ctx.restore();
+      // katak
+      ctx.globalAlpha=I*fillK; ctx.drawImage(TIMG.toad,0,0);
+      if (draw<1){ ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.globalAlpha=(1-draw)*0.8*I; ctx.drawImage(TGLOW.c,0,0,TI.w,TI.h); ctx.restore(); }   // kilatan saat muncul
+      // corak menyala berdenyut
+      ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.filter=hf;
+      ctx.globalAlpha=I*fillK*(0.25+0.55*pulse); ctx.drawImage(TIMG.em,0,0);
+      ctx.filter=(hf==='none'?'':hf+' ')+'blur(6px)'; ctx.globalAlpha=I*fillK*(0.3+0.5*pulse); ctx.drawImage(TIMG.em,0,0); ctx.restore();
+      // tenggorokan menggembung saat krok
+      if (mouthOpen>0.02){ const [tx,ty]=TI.throat, r=150*mouthOpen; ctx.save(); ctx.globalCompositeOperation='lighter';
+        const gr=ctx.createRadialGradient(tx,ty,0,tx,ty,r); gr.addColorStop(0,rgba(PAL.glow,0.45*mouthOpen*I)); gr.addColorStop(1,rgba(PAL.glow,0));
+        ctx.fillStyle=gr; ctx.beginPath(); ctx.ellipse(tx,ty,r*1.3,r,0,0,7); ctx.fill(); ctx.restore(); }
+      // mata: kelopak menutup saat kedip / sebelum terbuka, pendar emas saat terbuka
+      for (const [ex,ey] of TI.eyes){ const R=TI.eyeR;
+        if (eyeOpen<0.98){ ctx.save(); ctx.globalAlpha=I*fillK; ctx.fillStyle='rgb(38,46,30)'; ctx.beginPath(); ctx.ellipse(ex,ey-R*0.2,R*1.55,R*1.25*(1-eyeOpen)+0.5,0,0,7); ctx.fill();
+          ctx.strokeStyle='rgba(15,18,10,0.9)'; ctx.lineWidth=3; ctx.beginPath(); ctx.ellipse(ex,ey-R*0.2+R*1.25*(1-eyeOpen),R*1.5,2,0,0,7); ctx.stroke(); ctx.restore(); }
+        if (eyeOpen>0.05){ ctx.save(); ctx.globalCompositeOperation='lighter'; const gr=ctx.createRadialGradient(ex,ey,0,ex,ey,R*3);
+          gr.addColorStop(0,`rgba(255,200,60,${0.5*eyeOpen*I})`); gr.addColorStop(1,'rgba(255,160,20,0)'); ctx.fillStyle=gr; ctx.beginPath(); ctx.arc(ex,ey,R*3,0,7); ctx.fill(); ctx.restore(); } }
+      ctx.restore();
+    }
+  }
+  drawSmoke(dt);
+  if (showLm) hs.forEach(drawHand);
+  ctx.restore();
+  if (flash>0){ ctx.fillStyle=rgba(PAL.core,flash); ctx.fillRect(0,0,W,H); flash=Math.max(0,flash-dt*2); }
+
+  const lab = S.on ? (since<2.6 ? '' : S.palmHold>0.05 ? 'Tahan…' : 'Tahan telapak terbuka untuk memulangkan') : (S.cool>0 ? '' : 'Buka telapak, tepuk ke bawah');
+  $fill.style.width = (S.on ? clamp01((S.palmHold||0)/T.holdPalm)*100 : 0)+'%';
+  $label.textContent=lab; $label.style.opacity=lab?1:0;
+  $stat.textContent=`${fps} fps · tangan ${hs.length} ${hs.map(h=>h.open?'✋':'·').join('')} · wajah ${F?'ya':'tidak'} · ${PAL.name}`;
+  requestAnimationFrame(frame);
+}
+const HB=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawHand(h){
+  ctx.strokeStyle=h.open?rgba(PAL.glow,.9):'rgba(255,255,255,.5)'; ctx.lineWidth=2;
+  for (const [a,b] of HB){ ctx.beginPath(); ctx.moveTo(h.pts[a].x,h.pts[a].y); ctx.lineTo(h.pts[b].x,h.pts[b].y); ctx.stroke(); }
+  ctx.fillStyle='#fff'; ctx.font='bold 13px sans-serif'; ctx.fillText(h.ext.map(e=>e?'1':'0').join(''), h.pts[0].x+8, h.pts[0].y+16);
+}
+
+// ---------- boot ----------
+async function loadModels(){
+  $label.textContent='Memuat model…';
+  const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const M="https://storage.googleapis.com/mediapipe-models/";
+  [hands, face] = await Promise.all([
+    HandLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" }, runningMode:"VIDEO", numHands:2 }),
+    FaceLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate:"GPU" }, runningMode:"VIDEO", numFaces:1 }),
+  ]);
+}
+document.getElementById('go').onclick=async()=>{
+  const err=document.getElementById('err'); err.textContent=''; initAudio();
+  try{
+    if (params.get('src')) video.src=params.get('src');
+    else video.srcObject=await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+    await video.play(); await Promise.all([loadModels(), loadTI('toad','assets/toad.png'), loadTI('em','assets/toad_em.png')]);
+    document.getElementById('start').classList.add('hide');
+    if (!running){ running=true; requestAnimationFrame(frame); }
+  }catch(e){ console.error(e); err.textContent='Gagal: '+(e.message||e.name); }
+};
+addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if (PALETTES[k]){ PAL=PALETTES[k]; document.documentElement.style.setProperty('--c', rgba(PAL.glow,1)); }
+  if (k==='h'){ showHud=!showHud; document.getElementById('hud').classList.toggle('hide',!showHud); }
+  if (k==='l') showLm=!showLm;
+  if (k==='k' && S.cool<=0) toggle();
+  if (k==='r'){ S.on=false; S.tOff=S.t-5; }
+});
+</script>
+<script src="../shared/clouds.js"></script>
+<script src="../shared/start.js"></script>
+</body>
+</html>

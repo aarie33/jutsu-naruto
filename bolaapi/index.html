@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bola Api Detector</title>
+<style>
+  :root { --c:#ff8a2a; --ink:#fff4ea; }
+  html,body { margin:0; height:100%; background:#0a0503; overflow:hidden;
+    font-family: ui-sans-serif, -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif; color:var(--ink); }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  video { display:none; }
+  #hud { position:fixed; inset:0; pointer-events:none; }
+  #seals { position:absolute; top:4vh; left:0; right:0; display:flex; justify-content:center; gap:12px; }
+  .seal { padding:8px 14px; border-radius:999px; font-weight:800; letter-spacing:.12em; font-size:clamp(11px,1.4vw,15px);
+    background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.18); color:rgba(255,255,255,.55); transition:all .2s; }
+  .seal.done { background:rgba(255,120,30,.85); color:#1a0700; border-color:#ffd2a0; box-shadow:0 0 24px rgba(255,130,40,.7); }
+  .seal.next { color:#fff; border-color:rgba(255,200,140,.8); }
+  #label { position:absolute; top:12vh; left:0; right:0; text-align:center; font-weight:800; letter-spacing:.14em;
+    font-size:clamp(14px,2.4vw,26px); text-transform:uppercase; text-shadow:0 2px 18px rgba(0,0,0,.85); transition:opacity .25s; }
+  #stat { position:absolute; bottom:2vh; left:0; right:0; text-align:center; font-size:12px; opacity:.45; letter-spacing:.1em; }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../shared/start.css">
+</head>
+<body>
+<video id="cam" playsinline muted loop></video>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="seals"><div class="seal" id="s0">1 · DUA JARI</div><div class="seal" id="s1">2 · KEPALAN</div><div class="seal" id="s2">3 · TELAPAK</div></div>
+  <div id="label">Memuat…</div>
+  <div id="stat"></div>
+</div>
+<div id="start" style="--accent:#ff8a2a">
+  <div class="st-wrap">
+    <header class="st-head">
+      <h1 class="st-title">Bola Api</h1>
+      <p class="st-lede">Tiga segel, lalu semburkan api dari mulutmu.</p>
+    </header>
+    <ol class="st-steps"><li><p><b>Dua jari</b><span>Kedua tangan bergabung, telunjuk dan jari tengah ke atas.</span></p></li><li><p><b>Kepalan</b><span>Dua kepalan tangan saling menempel.</span></p></li><li><p><b>Telapak</b><span>Dua telapak terbuka menempel, jari ke atas.</span></p></li><li><p><b>Toleh dan buka mulut</b><span>Api menyembur ke arah kamu menghadap. Makin lebar mulut, makin besar apinya.</span></p></li></ol>
+    <div class="st-actions">
+      <div class="st-row">
+        <button id="go" class="st-go" type="button"><span class="st-label">Mulai kamera</span><svg class="st-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><svg class="st-spin" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-opacity=".3" stroke-width="2.5"/><path d="M17.5 10A7.5 7.5 0 0 0 10 2.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></button>
+        
+      </div>
+      <p class="st-privacy"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.5"/></svg>Kamera diproses langsung di perangkatmu. Tidak ada video yang dikirim.</p>
+      <p id="err" role="alert"></p>
+    </div>
+    <footer class="st-keys"><span><kbd>H</kbd>sembunyikan HUD</span><span><kbd>L</kbd>titik tangan</span><span><kbd>K</kbd>lewati segel</span><span><kbd>F</kbd>tahan untuk menyembur</span><span><kbd>R</kbd>reset</span><span><kbd>C</kbd>awan</span></footer>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, FaceLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- tunables ----------
+const T = {
+  sealHold: 0.25,     // detik sebuah segel harus ditahan agar terhitung
+  sealGap: 3.0,       // jeda maksimal antar segel sebelum urutan reset
+  armedTime: 7.0,     // setelah 3 segel, waktu untuk membuka mulut
+  joinDist: 2.4,      // dua tangan dianggap bergabung kalau jarak telapak < ini × ukuran tangan
+  upCos: 0.45,        // seberapa tegak jari harus menunjuk ke atas (makin kecil makin longgar)
+  oneHand: true,      // terima segel walau cuma satu tangan terdeteksi (tangan sering saling menutupi)
+  mouthOpen: 0.07,    // rasio bukaan mulut minimal untuk menyembur
+  mouthFull: 0.22,    // rasio bukaan mulut untuk api maksimal
+  reach: 0.9,         // jarak semburan relatif lebar layar
+  fireSize: 1.0,      // ukuran gumpalan api (×)
+  faceTurn: 0.06,     // seberapa menoleh wajah supaya arah semburan ikut (di bawah ini → ke sisi yang lebih lega)
+};
+const params = new URLSearchParams(location.search);
+const TS = +params.get('ts') || 1;
+const clamp01 = v => Math.max(0, Math.min(1, v));
+
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const video=document.getElementById('cam');
+const $label=document.getElementById('label'), $stat=document.getElementById('stat'), $s=[0,1,2].map(i=>document.getElementById('s'+i));
+let W=0,H=0;
+function resize(){ W=innerWidth; H=innerHeight; cv.width=W; cv.height=H; }
+addEventListener('resize',resize); resize();
+let hands=null, face=null, showHud=true, showLm=false, running=false, forceFire=false;
+
+// ---------- audio (disintesis) ----------
+let A=null;
+function initAudio(){ if (A) return; const ac=new (window.AudioContext||window.webkitAudioContext)();
+  const master=ac.createGain(); master.gain.value=0.9; master.connect(ac.destination);
+  const buf=ac.createBuffer(1,ac.sampleRate*2,ac.sampleRate), d=buf.getChannelData(0); for (let i=0;i<d.length;i++) d[i]=Math.random()*2-1;
+  // deru api: noise → lowpass + bandpass
+  const ns=ac.createBufferSource(); ns.buffer=buf; ns.loop=true;
+  const lp=ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=600;
+  const roar=ac.createGain(); roar.gain.value=0; ns.connect(lp); lp.connect(roar); roar.connect(master);
+  const bp=ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=2200; bp.Q.value=0.8;
+  const hiss=ac.createGain(); hiss.gain.value=0; ns.connect(bp); bp.connect(hiss); hiss.connect(master); ns.start();
+  const o=ac.createOscillator(); o.type='sine'; o.frequency.value=45; const rum=ac.createGain(); rum.gain.value=0; o.connect(rum); rum.connect(master); o.start();
+  A={ac,master,buf,roar,hiss,lp,rum}; }
+function fireAudio(k){ if (!A) return; const t=A.ac.currentTime;
+  A.roar.gain.setTargetAtTime(0.9*k*(0.85+0.15*Math.random()),t,0.05); A.hiss.gain.setTargetAtTime(0.25*k,t,0.05);
+  A.lp.frequency.setTargetAtTime(400+1800*k,t,0.08); A.rum.gain.setTargetAtTime(0.5*k,t,0.1); }
+const tone=(len,type,f0,f1,vol)=>{ if (!A) return; const ac=A.ac,t=ac.currentTime,o=ac.createOscillator(); o.type=type; o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(f1,t+len);
+  const g=ac.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+len); o.connect(g); g.connect(A.master); o.start(t); o.stop(t+len+0.05); };
+const noiseHit=(len,type,f0,f1,vol)=>{ if (!A) return; const ac=A.ac,t=ac.currentTime,n=ac.createBufferSource(); n.buffer=A.buf; const f=ac.createBiquadFilter(); f.type=type;
+  f.frequency.setValueAtTime(f0,t); f.frequency.exponentialRampToValueAtTime(f1,t+len); const g=ac.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+len);
+  n.connect(f); f.connect(g); g.connect(A.master); n.start(t); n.stop(t+len+0.05); };
+const sfxSeal=i=>{ tone(0.12,'triangle',700+i*180,900+i*180,0.3); noiseHit(0.06,'highpass',3000,2000,0.25); };
+const sfxWrong=()=>tone(0.3,'square',180,120,0.12);
+const sfxArm=()=>{ noiseHit(0.8,'bandpass',300,2500,0.4); tone(0.9,'sine',80,160,0.4); };
+const sfxIgnite=()=>{ noiseHit(0.5,'lowpass',6000,300,0.9); tone(0.6,'sine',120,40,0.8); };
+const sfxFizzle=()=>noiseHit(0.5,'highpass',4000,1500,0.25);
+
+// ---------- tracking ----------
+let cover={s:1,ox:0,oy:0,dw:1,dh:1,vw:1280,vh:720};
+function computeCover(){ const vw=video.videoWidth||1280, vh=video.videoHeight||720, s=Math.max(W/vw,H/vh); cover={s,vw,vh,dw:vw*s,dh:vh*s,ox:(W-vw*s)/2,oy:(H-vh*s)/2}; }
+const toScreen = l => ({ x:cover.ox+(1-l.x)*cover.dw, y:cover.oy+l.y*cover.dh });
+const FINGERS=[[8,6],[12,10],[16,14],[20,18]], PALM=[0,5,9,13,17];
+function analyseHand(lms){
+  const {vw,vh}=cover, p3=i=>({x:lms[i].x*vw,y:lms[i].y*vh,z:lms[i].z*vw}), d3=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);
+  const w=p3(0), ext=FINGERS.map(([t,p])=>d3(w,p3(t))>d3(w,p3(p))*1.12), n=ext.filter(Boolean).length;
+  const pts=lms.map(toScreen); let cx=0,cy=0; for (const i of PALM){ cx+=pts[i].x; cy+=pts[i].y; }
+  const base={x:(pts[5].x+pts[9].x)/2,y:(pts[5].y+pts[9].y)/2}, tip={x:(pts[8].x+pts[12].x)/2,y:(pts[8].y+pts[12].y)/2};
+  const len=Math.hypot(tip.x-base.x,tip.y-base.y)||1, up=-(tip.y-base.y)/len>T.upCos;
+  return { pts, ext, n, cx:cx/5, cy:cy/5, size:Math.hypot(pts[0].x-pts[9].x,pts[0].y-pts[9].y),
+    two: ext[0]&&ext[1]&&(ext[2]+ext[3])<=1 && up, fist: n===0, open: n>=4 && up };
+}
+// segel yang terlihat sekarang: 0 = dua jari, 1 = kepalan beradu, 2 = telapak menyatu, -1 = tidak ada
+function currentSeal(hs){
+  if (hs.length>=2){ const [a,b]=hs, d=Math.hypot(a.cx-b.cx,a.cy-b.cy), sz=(a.size+b.size)/2;
+    if (d <= T.joinDist*sz){
+      if (a.two && b.two) return 0;
+      if (a.fist && b.fist) return 1;
+      if (a.open && b.open) return 2;
+      // tangan bertumpuk: tangan belakang sering terbaca salah, cukup tangan yang jelas
+      if ((a.two||b.two) && !a.open && !b.open) return 0;
+      if ((a.open||b.open) && !a.two && !b.two && !(a.fist&&b.fist)) return 2;
+    }
+  }
+  if (T.oneHand && hs.length===1){ const a=hs[0]; if (a.two) return 0; if (a.fist) return 1; if (a.open) return 2; }
+  return -1;
+}
+let F=null;
+function analyseFace(lms){ const P=i=>toScreen(lms[i]);
+  const up=P(13), lo=P(14), fh=Math.hypot(P(10).x-P(152).x, P(10).y-P(152).y);
+  return { mouth:{ x:(up.x+lo.x)/2, y:(up.y+lo.y)/2 }, open: Math.hypot(up.x-lo.x, up.y-lo.y)/fh, fw: Math.hypot(P(234).x-P(454).x, P(234).y-P(454).y), fh,
+    nose:P(1), midX:(P(234).x+P(454).x)/2 }; }
+
+// ---------- api kartun (orisinal): gumpalan berlapis + garis tepi tebal ----------
+const COL = { crimson:'#a8180a', red:'#e8420e', orange:'#ff8c1c', yellow:'#ffd94a', core:'#fffbe2', smoke:'#3a3330', smokeHi:'#5c524d', line:'#3b0c02' };
+const fire=[], smoke=[], sparks=[];
+let pid=0;
+function emitFire(mx, my, k, dt, fw, dir){
+  const n=Math.round((40+90*k)*dt*TS/TS*1.0 + Math.random());
+  const sp=W*T.reach/0.62;   // kecepatan supaya sampai ±reach dalam umur partikel
+  for (let i=0;i<n;i++){
+    const ang=(Math.random()-0.5)*0.3 + 0.03, life=0.5+Math.random()*0.25, v=sp*(0.75+Math.random()*0.35);
+    fire.push({ id:pid++, x:mx+dir*fw*0.28, y:my+fw*0.03, vx:dir*Math.cos(ang)*v, vy:Math.sin(ang)*v,
+      r0:fw*0.06*T.fireSize, r1:fw*(0.28+0.32*k)*T.fireSize*(0.7+Math.random()*0.6), age:0, life });
+  }
+}
+function stepParticles(dt){
+  for (let i=fire.length-1;i>=0;i--){ const p=fire[i]; p.age+=dt; if (p.age>p.life){
+      if (Math.random()<0.5) smoke.push({ x:p.x, y:p.y, vx:p.vx*0.15, vy:-H*0.12, r:p.r1*0.7, age:0, life:0.8+Math.random()*0.6 });
+      if (Math.random()<0.4) sparks.push({ x:p.x, y:p.y, vx:p.vx*0.4+(Math.random()-0.5)*W*0.2, vy:-H*(0.2+Math.random()*0.4), age:0, life:0.6+Math.random()*0.5, s:3+Math.random()*4 });
+      fire.splice(i,1); continue; }
+    p.vx*=Math.pow(0.35,dt); p.vy=p.vy*Math.pow(0.35,dt)-H*0.08*dt; p.x+=p.vx*dt; p.y+=p.vy*dt; }
+  for (let i=smoke.length-1;i>=0;i--){ const p=smoke[i]; p.age+=dt; if (p.age>p.life){ smoke.splice(i,1); continue; } p.x+=p.vx*dt; p.y+=p.vy*dt; }
+  for (let i=sparks.length-1;i>=0;i--){ const p=sparks[i]; p.age+=dt; if (p.age>p.life){ sparks.splice(i,1); continue; } p.vy+=H*0.9*dt; p.x+=p.vx*dt; p.y+=p.vy*dt; }
+}
+const fr = (p,t) => { const k=p.age/p.life, grow=Math.min(1,k*3); const r=(p.r0+(p.r1-p.r0)*grow)*(1-Math.pow(k,3)*0.85); return r*(1+0.09*Math.sin(t*22+p.id)); };
+// bentuk lidah api runcing (bintang meliuk), memanjang ke belakang arah gerak
+function flamePath(p, r, t, k){
+  const N=7, dirA=Math.atan2(p.vy,p.vx)+Math.PI, wob=t*18+p.id;
+  for (let i=0;i<=N*2;i++){ const a=dirA + (i/(N*2))*Math.PI*2, tip=i%2===0;
+    // ujung yang searah ekor (belakang) lebih panjang → api terlihat "terseret"
+    const back=Math.max(0,Math.cos(a-dirA)), R = tip ? r*(1.15+0.55*back+0.18*Math.sin(wob+i)) : r*(0.78+0.05*Math.sin(wob*1.3+i));
+    const X=p.x+Math.cos(a)*R, Y=p.y+Math.sin(a)*R - (tip? r*0.18*(1-back):0);
+    i ? ctx.lineTo(X,Y) : ctx.moveTo(X,Y); }
+  ctx.closePath();
+}
+function layer(list, t, scale, col, filter, lift=0){
+  ctx.fillStyle=col; ctx.beginPath();
+  for (const p of list){ const k=p.age/p.life; if (filter && !filter(k)) continue; const r=fr(p,t)*scale; if (r<=1) continue;
+    const q={ x:p.x, y:p.y-r*lift, vx:p.vx, vy:p.vy, id:p.id }; flamePath(q, r, t, k); }
+  ctx.fill('nonzero');
+}
+function drawParticles(t){
+  // asap gelap dengan sisi terang tegas (tanpa garis tepi)
+  const sm = smoke.map(p=>({ x:p.x, y:p.y, r:p.r*(1-Math.pow(p.age/p.life,2)) }));
+  ctx.fillStyle=COL.smoke; ctx.beginPath(); for (const p of sm){ ctx.moveTo(p.x+p.r,p.y); ctx.arc(p.x,p.y,p.r,0,7); } ctx.fill();
+  ctx.fillStyle=COL.smokeHi; ctx.beginPath(); for (const p of sm){ ctx.moveTo(p.x-p.r*0.2+p.r*0.6,p.y-p.r*0.25); ctx.arc(p.x-p.r*0.2,p.y-p.r*0.25,p.r*0.6,0,7); } ctx.fill();
+  // pendar lembut di bawah api
+  if (fire.length){ ctx.save(); ctx.globalCompositeOperation='lighter';
+    for (let i=0;i<fire.length;i+=6){ const p=fire[i], r=fr(p,t)*2.2; const g=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,r);
+      g.addColorStop(0,'rgba(255,150,40,0.22)'); g.addColorStop(1,'rgba(255,80,0,0)'); ctx.fillStyle=g; ctx.fillRect(p.x-r,p.y-r,r*2,r*2); }
+    ctx.restore(); }
+  // pita warna bertingkat (cel shading): merah tua → merah → jingga → kuning → inti
+  layer(fire, t, 1.12, COL.crimson);
+  layer(fire, t, 0.98, COL.red, k=>k<0.92);
+  layer(fire, t, 0.78, COL.orange, k=>k<0.78, 0.06);
+  layer(fire, t, 0.55, COL.yellow, k=>k<0.55, 0.1);
+  layer(fire, t, 0.3,  COL.core, k=>k<0.3, 0.12);
+  // garis kecepatan searah semburan
+  ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.lineCap='round';
+  for (let i=0;i<fire.length;i+=9){ const p=fire[i], k=p.age/p.life; if (k>0.6) continue; const sp=Math.hypot(p.vx,p.vy)||1, L=fr(p,t)*2.4;
+    ctx.strokeStyle=`rgba(255,240,200,${0.5*(1-k)})`; ctx.lineWidth=Math.max(1.5,fr(p,t)*0.06);
+    const ox=(Math.sin(p.id*1.7))*fr(p,t)*0.6, oy=(Math.cos(p.id*2.3))*fr(p,t)*0.6;
+    ctx.beginPath(); ctx.moveTo(p.x+ox, p.y+oy); ctx.lineTo(p.x+ox-p.vx/sp*L, p.y+oy-p.vy/sp*L); ctx.stroke(); }
+  ctx.restore();
+  // percikan: belah ketupat kecil menyala
+  ctx.fillStyle=COL.yellow;
+  for (const p of sparks){ const k=1-p.age/p.life, s=p.s*k; if (s<0.5) continue; ctx.beginPath(); ctx.moveTo(p.x,p.y-s); ctx.lineTo(p.x+s*0.45,p.y); ctx.lineTo(p.x,p.y+s); ctx.lineTo(p.x-s*0.45,p.y); ctx.closePath(); ctx.fill(); }
+}
+// bara kecil di depan mulut (siap menyembur) — juga gaya kartun
+function drawEmber(x,y,k,t,fw,dir){ if (k<=0) return; const r=fw*0.07*(1+0.2*Math.sin(t*12)), cx=x+dir*fw*0.22, cy=y;
+  const flame=(sc,col)=>{ ctx.fillStyle=col; ctx.beginPath(); ctx.moveTo(cx-r*sc,cy); ctx.quadraticCurveTo(cx-r*sc,cy-r*sc*1.6,cx+Math.sin(t*9)*r*0.3,cy-r*sc*2.4);
+    ctx.quadraticCurveTo(cx+r*sc,cy-r*sc*1.6,cx+r*sc,cy); ctx.arc(cx,cy,r*sc,0,Math.PI); ctx.fill(); };
+  ctx.save(); ctx.globalAlpha=k; flame(1.2,COL.crimson); flame(1.0,COL.red); flame(0.7,COL.orange); flame(0.4,COL.yellow); ctx.restore(); }
+
+// ---------- state ----------
+const S={ t:0, step:0, lastSealT:-99, holdSeal:-1, holdT:0, armed:false, armT:0, firing:false, fireK:0, ballR:0, msg:'', msgT:0 };
+window.__S=S;
+let shake=0, flash=0, heat=0;
+function resetSeq(msg){ S.step=0; S.holdSeal=-1; S.holdT=0; if (msg){ S.msg=msg; S.msgT=S.t; } }
+function arm(){ S.armed=true; S.armT=S.t; S.step=3; sfxArm(); flash=0.25; }
+
+// ---------- loop ----------
+let last=performance.now(), lastVid=-1, hs=[], fpsAcc=0,fpsN=0,fps=0;
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000)*TS; last=now; S.t+=dt; const t=S.t;
+  fpsAcc+=dt/TS; fpsN++; if (fpsAcc>0.5){ fps=Math.round(fpsN/fpsAcc); fpsAcc=0; fpsN=0; }
+  if (video.readyState>=2 && video.currentTime!==lastVid){
+    lastVid=video.currentTime; computeCover();
+    if (hands) hs=(hands.detectForVideo(video,now).landmarks||[]).map(analyseHand);
+    if (face){ const r=face.detectForVideo(video,now); F=r.faceLandmarks?.[0]?analyseFace(r.faceLandmarks[0]):null; }
+  }
+  // --- urutan segel ---
+  const seal=currentSeal(hs);
+  if (!S.armed && !S.firing){
+    if (S.step>0 && t-S.lastSealT>T.sealGap) resetSeq('Kelamaan — ulangi dari segel 1'), sfxFizzle();
+    if (seal>=0){
+      if (seal===S.holdSeal) S.holdT+=dt; else { S.holdSeal=seal; S.holdT=0; }
+      if (S.holdT>=T.sealHold){
+        if (seal===S.step){ sfxSeal(seal); S.step++; S.lastSealT=t; S.holdT=-99; if (S.step===3) arm(); }
+        else if (seal!==S.step-1 && S.holdT>=T.sealHold && S.holdT<T.sealHold+dt*1.5){ sfxWrong(); resetSeq('Urutan salah — mulai dari segel 1'); }
+      }
+    } else { S.holdSeal=-1; S.holdT=0; }
+  }
+  // --- semburan api ---
+  const mouthR = F ? clamp01((F.open-T.mouthOpen)/(T.mouthFull-T.mouthOpen)) : 0;
+  const want = (S.armed || S.firing) && (forceFire ? 1 : (F && F.open>T.mouthOpen ? Math.max(0.15,mouthR) : 0));
+  if (S.armed && want>0){ S.armed=false; S.firing=true; sfxIgnite(); flash=0.35; shake=0.6; }
+  if (S.armed && t-S.armT>T.armedTime){ S.armed=false; resetSeq('Api padam — ulangi segel'); sfxFizzle(); }
+  S.fireK += ((S.firing?want:0) - S.fireK)*Math.min(1,dt*(want>S.fireK?10:5));
+  if (S.firing && want===0 && S.fireK<0.05){ S.firing=false; resetSeq(); }
+  const md=Math.min(W,H);
+  const mx = F ? F.mouth.x : W/2, my = F ? F.mouth.y : H*0.5, fw = F ? F.fw : md*0.25;
+  // arah semburan: ikut arah hidung (wajah menoleh), kalau menghadap depan → ke sisi yang lebih lega
+  const turn = F ? (F.nose.x - F.midX)/F.fw : 0;
+  const tdir = Math.abs(turn) > T.faceTurn ? Math.sign(turn) : (mx < W/2 ? 1 : -1);
+  S.dir = (S.dir ?? tdir) + (tdir - (S.dir ?? tdir))*Math.min(1, dt*6);
+  const dir = S.dir>=0 ? Math.max(0.3,S.dir) : Math.min(-0.3,S.dir);
+  if (S.fireK>0.03) emitFire(mx, my, S.fireK, dt, fw, Math.sign(dir));
+  stepParticles(dt);
+  heat += ((S.fireK>0.03 ? 0.4+0.6*S.fireK : S.armed ? 0.25 : 0) - heat)*Math.min(1,dt*4);
+  if (S.fireK>0.05) shake=Math.max(shake, 0.25+0.5*S.fireK);
+  fireAudio(S.fireK);
+
+  // --- render ---
+  ctx.save();
+  if (shake>0){ const m=shake*12; ctx.translate((Math.random()-0.5)*m,(Math.random()-0.5)*m); shake=Math.max(0,shake-dt*2); }
+  ctx.fillStyle='#000'; ctx.fillRect(-20,-20,W+40,H+40);
+  if (video.readyState>=2){ ctx.save(); ctx.translate(cover.ox+cover.dw, cover.oy); ctx.scale(-1,1); ctx.drawImage(video,0,0,cover.dw,cover.dh); ctx.restore(); }
+  // panas: rona jingga + vinyet berkedip
+  if (heat>0.01){ ctx.fillStyle=`rgba(255,90,10,${0.16*heat*(0.85+0.15*Math.sin(t*17))})`; ctx.globalCompositeOperation='overlay'; ctx.fillRect(-20,-20,W+40,H+40); ctx.globalCompositeOperation='source-over';
+    }
+  drawParticles(t);
+  if (S.armed) drawEmber(mx, my, 0.8+0.2*Math.sin(t*8), t, fw, Math.sign(dir));
+  if (showLm) hs.forEach(drawHand);
+  ctx.restore();
+  if (flash>0){ ctx.fillStyle=`rgba(255,230,190,${flash})`; ctx.fillRect(0,0,W,H); flash=Math.max(0,flash-dt*2.2); }
+
+  // --- hud ---
+  $s.forEach((el,i)=>{ el.classList.toggle('done', i<S.step); el.classList.toggle('next', i===S.step && !S.firing); });
+  const names=['dua jari','kepalan','telapak'];
+  const lab = S.firing ? '' : S.armed ? 'Buka mulut lebar!' : (t-S.msgT<1.6 && S.msg) ? S.msg : !F ? 'Wajah belum terdeteksi' : ['Segel 1: dua jari ke atas','Segel 2: kepalan beradu','Segel 3: telapak menyatu'][S.step]||'';
+  $label.textContent=lab; $label.style.opacity=lab?1:0;
+  $stat.textContent=`${fps} fps · tangan ${hs.length} · segel: ${seal>=0?names[seal]:'-'} · mulut ${F?(F.open*100).toFixed(0):'-'}`;
+  requestAnimationFrame(frame);
+}
+const HB=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawHand(h){ ctx.strokeStyle=h.two?'rgba(255,200,120,.9)':h.fist?'rgba(255,120,60,.9)':h.open?'rgba(255,240,200,.9)':'rgba(255,255,255,.4)'; ctx.lineWidth=2;
+  for (const [a,b] of HB){ ctx.beginPath(); ctx.moveTo(h.pts[a].x,h.pts[a].y); ctx.lineTo(h.pts[b].x,h.pts[b].y); ctx.stroke(); }
+  ctx.fillStyle='#fff'; ctx.font='bold 13px sans-serif'; ctx.fillText((h.two?'2J':h.fist?'KP':h.open?'TP':'')+' '+h.ext.map(e=>e?'1':'0').join(''), h.pts[0].x+8, h.pts[0].y+16); }
+
+// ---------- boot ----------
+async function loadModels(){
+  $label.textContent='Memuat model…';
+  const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const M="https://storage.googleapis.com/mediapipe-models/";
+  [hands, face] = await Promise.all([
+    HandLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" }, runningMode:"VIDEO", numHands:2 }),
+    FaceLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate:"GPU" }, runningMode:"VIDEO", numFaces:1 }),
+  ]);
+}
+document.getElementById('go').onclick=async()=>{
+  const err=document.getElementById('err'); err.textContent=''; initAudio();
+  try{
+    if (params.get('src')) video.src=params.get('src');
+    else video.srcObject=await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+    await video.play(); await loadModels();
+    document.getElementById('start').classList.add('hide');
+    if (!running){ running=true; requestAnimationFrame(frame); }
+  }catch(e){ console.error(e); err.textContent='Gagal: '+(e.message||e.name); }
+};
+addEventListener('keydown',e=>{ const k=e.key.toLowerCase();
+  if (k==='h'){ showHud=!showHud; document.getElementById('hud').classList.toggle('hide',!showHud); }
+  if (k==='l') showLm=!showLm;
+  if (k==='k' && !S.armed && !S.firing){ arm(); }
+  if (k==='f') forceFire=true;
+  if (k==='r'){ S.armed=false; S.firing=false; S.fireK=0; resetSeq(); } });
+addEventListener('keyup',e=>{ if (e.key.toLowerCase()==='f') forceFire=false; });
+</script>
+<script src="../shared/clouds.js"></script>
+<script src="../shared/start.js"></script>
+</body>
+</html>

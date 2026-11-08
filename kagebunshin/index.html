@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kage Bunshin Detector</title>
+<style>
+  :root { --amber:#ffb347; --ink:#fff6ea; }
+  html,body { margin:0; height:100%; background:#07070a; overflow:hidden;
+    font-family: ui-sans-serif, -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif; color:var(--ink); }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  video { display:none; }
+  #hud { position:fixed; inset:0; pointer-events:none; }
+  #label { position:absolute; top:5vh; left:0; right:0; text-align:center; font-weight:800; letter-spacing:.14em;
+    font-size:clamp(14px,2.4vw,26px); text-transform:uppercase; text-shadow:0 2px 18px rgba(0,0,0,.85); transition:opacity .25s; }
+  #bar { position:absolute; bottom:6vh; left:50%; transform:translateX(-50%); width:min(46vw,420px); height:8px;
+    border-radius:8px; background:rgba(255,255,255,.12); overflow:hidden; }
+  #fill { height:100%; width:0%; background:linear-gradient(90deg,#ff7a2f,var(--amber),#fff); box-shadow:0 0 18px var(--amber); }
+  #stat { position:absolute; bottom:2vh; left:0; right:0; text-align:center; font-size:12px; opacity:.45; letter-spacing:.1em; }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../shared/start.css">
+</head>
+<body>
+<video id="cam" playsinline muted loop></video>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="label">Memuat…</div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="stat"></div>
+</div>
+<div id="start" style="--accent:#ffb347">
+  <div class="st-wrap">
+    <header class="st-head">
+      <h1 class="st-title">Kage Bunshin</h1>
+      <p class="st-lede">Empat bayangan dirimu muncul dari balik asap.</p>
+    </header>
+    <ol class="st-steps"><li><p><b>Dua jari di tiap tangan</b><span>Telunjuk dan jari tengah lurus, jari lain ditekuk.</span></p></li><li><p><b>Silangkan</b><span>Satu pasang tegak, satu mendatar, lalu tahan.</span></p></li><li><p><b>Ulangi segel</b><span>untuk menghilangkan bayangan.</span></p></li></ol>
+    <div class="st-actions">
+      <div class="st-row">
+        <button id="go" class="st-go" type="button"><span class="st-label">Mulai kamera</span><svg class="st-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><svg class="st-spin" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-opacity=".3" stroke-width="2.5"/><path d="M17.5 10A7.5 7.5 0 0 0 10 2.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></button>
+        
+      </div>
+      <p class="st-privacy"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.5"/></svg>Kamera diproses langsung di perangkatmu. Tidak ada video yang dikirim.</p>
+      <p id="err" role="alert"></p>
+    </div>
+    <footer class="st-keys"><span><kbd>H</kbd>sembunyikan HUD</span><span><kbd>L</kbd>titik tangan</span><span><kbd>K</kbd>paksa jutsu</span><span><kbd>R</kbd>reset</span><span><kbd>C</kbd>awan</span></footer>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, ImageSegmenter } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- tunables ----------
+const T = {
+  holdSeal: 0.45,     // detik segel ditahan
+  maxCos: 0.7,        // |cos| sudut antar jari < 0.7  → sudut 45°–135°
+  crossDist: 0.75,    // jarak dua pasang jari < 0.75 × ukuran tangan
+  cooldown: 1.5,
+  maskLo: 0.35, maskHi: 0.75,   // threshold confidence segmentasi orang
+  // posisi bayangan: dx = fraksi lebar layar, s = skala (makin kecil makin jauh), delay = frame tertinggal
+  slots: [
+    { dx:-0.50, s:0.70, delay:10, bright:0.82 },
+    { dx: 0.50, s:0.70, delay:13, bright:0.82 },
+    { dx:-0.27, s:0.85, delay:4,  bright:0.92 },
+    { dx: 0.27, s:0.85, delay:7,  bright:0.92 },
+  ],
+};
+
+const params = new URLSearchParams(location.search);
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const video = document.getElementById('cam');
+const $label = document.getElementById('label'), $fill = document.getElementById('fill'), $stat = document.getElementById('stat');
+let W=0, H=0, DPR=1;
+function resize(){ DPR=Math.min(devicePixelRatio||1,2); W=innerWidth; H=innerHeight; cv.width=W*DPR; cv.height=H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); }
+addEventListener('resize', resize); resize();
+
+let hands=null, seg=null, showHud=true, showLm=false, running=false;
+
+// ---------- audio ----------
+let A=null;
+function initAudio(){
+  if (A) return;
+  const ac=new (window.AudioContext||window.webkitAudioContext)();
+  const master=ac.createGain(); master.gain.value=0.9; master.connect(ac.destination);
+  const buf=ac.createBuffer(1,ac.sampleRate*1.5,ac.sampleRate), d=buf.getChannelData(0);
+  for (let i=0;i<d.length;i++) d[i]=Math.random()*2-1;
+  A={ac,master,buf};
+}
+function sfxPoof(when=0, pitch=1){
+  if (!A) return; const ac=A.ac, t=ac.currentTime+when;
+  const n=ac.createBufferSource(); n.buffer=A.buf;
+  const f=ac.createBiquadFilter(); f.type='bandpass'; f.Q.value=0.8;
+  f.frequency.setValueAtTime(1400*pitch,t); f.frequency.exponentialRampToValueAtTime(250*pitch,t+0.45);
+  const g=ac.createGain(); g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.9,t+0.015); g.gain.exponentialRampToValueAtTime(0.001,t+0.55);
+  n.connect(f); f.connect(g); g.connect(A.master); n.start(t); n.stop(t+0.6);
+  const o=ac.createOscillator(); o.type='sine'; o.frequency.setValueAtTime(180*pitch,t); o.frequency.exponentialRampToValueAtTime(60,t+0.2);
+  const og=ac.createGain(); og.gain.setValueAtTime(0.5,t); og.gain.exponentialRampToValueAtTime(0.001,t+0.25);
+  o.connect(og); og.connect(A.master); o.start(t); o.stop(t+0.3);
+}
+function sfxSeal(){
+  if (!A) return; const ac=A.ac, t=ac.currentTime;
+  const o=ac.createOscillator(); o.type='triangle'; o.frequency.setValueAtTime(900,t); o.frequency.exponentialRampToValueAtTime(1800,t+0.08);
+  const g=ac.createGain(); g.gain.setValueAtTime(0.25,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.18);
+  o.connect(g); g.connect(A.master); o.start(t); o.stop(t+0.2);
+}
+
+// ---------- geometry ----------
+let cover={ s:1, ox:0, oy:0, dw:1, dh:1, vw:1280, vh:720 };
+function computeCover(){
+  const vw=video.videoWidth||1280, vh=video.videoHeight||720, s=Math.max(W/vw,H/vh);
+  cover={ s, vw, vh, dw:vw*s, dh:vh*s, ox:(W-vw*s)/2, oy:(H-vh*s)/2 };
+}
+const FINGERS=[[8,6],[12,10],[16,14],[20,18]];
+function analyse(lms){
+  const {vw,vh}=cover;
+  const p3=i=>({x:lms[i].x*vw, y:lms[i].y*vh, z:lms[i].z*vw});
+  const d3=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);
+  const w=p3(0), ext=FINGERS.map(([tip,pip])=> d3(w,p3(tip)) > d3(w,p3(pip))*1.12);
+  const pts=lms.map(l=>({ x:cover.ox+(1-l.x)*cover.dw, y:cover.oy+l.y*cover.dh }));
+  const base={ x:(pts[5].x+pts[9].x)/2, y:(pts[5].y+pts[9].y)/2 }, tip={ x:(pts[8].x+pts[12].x)/2, y:(pts[8].y+pts[12].y)/2 };
+  const size=Math.hypot(pts[0].x-pts[9].x, pts[0].y-pts[9].y);
+  const two = ext[0] && ext[1] && (ext[2]+ext[3])<=1;
+  return { pts, ext, base, tip, size, two };
+}
+function ptSeg(p,a,b){ const dx=b.x-a.x, dy=b.y-a.y, L=dx*dx+dy*dy||1; let t=((p.x-a.x)*dx+(p.y-a.y)*dy)/L; t=Math.max(0,Math.min(1,t));
+  return Math.hypot(p.x-(a.x+dx*t), p.y-(a.y+dy*t)); }
+function segDist(a1,a2,b1,b2){ // cek perpotongan dulu
+  const cr=(p,q,r)=>(q.x-p.x)*(r.y-p.y)-(q.y-p.y)*(r.x-p.x);
+  if (cr(a1,a2,b1)*cr(a1,a2,b2)<0 && cr(b1,b2,a1)*cr(b1,b2,a2)<0) return 0;
+  return Math.min(ptSeg(a1,b1,b2),ptSeg(a2,b1,b2),ptSeg(b1,a1,a2),ptSeg(b2,a1,a2));
+}
+function sealInfo(hs){
+  if (hs.length<2) return { ok:false, why: hs.length? 'Butuh dua tangan' : 'Tunjukkan tangan ke kamera' };
+  const [a,b]=hs;
+  if (!a.two || !b.two) return { ok:false, why:'Telunjuk + tengah lurus, jari lain tekuk' };
+  const va={x:a.tip.x-a.base.x, y:a.tip.y-a.base.y}, vb={x:b.tip.x-b.base.x, y:b.tip.y-b.base.y};
+  const cos=Math.abs(va.x*vb.x+va.y*vb.y)/((Math.hypot(va.x,va.y)*Math.hypot(vb.x,vb.y))||1);
+  if (cos>T.maxCos) return { ok:false, why:'Silangkan: satu tegak, satu mendatar' };
+  const dist=segDist(a.base,a.tip,b.base,b.tip), sz=(a.size+b.size)/2;
+  if (dist>sz*T.crossDist) return { ok:false, why:'Dekatkan jarinya sampai bersilang' };
+  const c = { x:(a.tip.x+b.tip.x+a.base.x+b.base.x)/4, y:(a.tip.y+b.tip.y+a.base.y+b.base.y)/4 };
+  return { ok:true, why:'Tahan…', c };
+}
+
+// ---------- person cutout + delay buffer ----------
+const BUF_N = 16;
+let maskC, maskX, maskImg, frames=[], head=0, centroid={x:0.5,y:0.5}, hasPerson=false;
+function setupBuffers(){
+  const vw=video.videoWidth, vh=video.videoHeight;
+  // buffer di resolusi ≤ 960px lebar biar ringan
+  const k=Math.min(1, 960/vw), bw=Math.round(vw*k), bh=Math.round(vh*k);
+  frames = Array.from({length:BUF_N}, ()=>{ const c=document.createElement('canvas'); c.width=bw; c.height=bh; return c; });
+  maskC=document.createElement('canvas');
+}
+function pushCutout(mask){
+  const mw=mask.width, mh=mask.height, conf=mask.getAsFloat32Array();
+  if (maskC.width!==mw||maskC.height!==mh){ maskC.width=mw; maskC.height=mh; maskX=maskC.getContext('2d'); maskImg=maskX.createImageData(mw,mh); }
+  const px=maskImg.data; let sx=0, sy=0, sn=0, top=mh;
+  const lo=T.maskLo, span=T.maskHi-T.maskLo;
+  for (let i=0, j=0; i<conf.length; i++, j+=4){
+    const a=Math.max(0,Math.min(1,(conf[i]-lo)/span));
+    px[j]=px[j+1]=px[j+2]=255; px[j+3]=a*255;
+    if (a>0.5 && (i&3)===0){ const y=(i/mw)|0; sx+=i%mw; sy+=y; sn++; if (y<top) top=y; }
+  }
+  maskX.putImageData(maskImg,0,0);
+  hasPerson = sn>50;
+  // titik asap: antara ujung kepala dan pusat badan (bagian atas tubuh)
+  if (hasPerson){ const cy=sy/sn, uy=top+(cy-top)*0.55;
+    centroid.x += (sx/sn/mw - centroid.x)*0.3; centroid.y += (uy/mh - centroid.y)*0.3; }
+  head=(head+1)%BUF_N; const f=frames[head], fx=f.getContext('2d');
+  fx.globalCompositeOperation='copy'; fx.drawImage(video,0,0,f.width,f.height);
+  fx.globalCompositeOperation='destination-in'; fx.filter='blur(1.5px)'; fx.drawImage(maskC,0,0,f.width,f.height); fx.filter='none';
+  fx.globalCompositeOperation='source-over';
+}
+const frameAt = delay => frames[(head - delay + BUF_N*4) % BUF_N];
+// transform: scale around frame bottom-center, then shift dx (screen px). Mirrored.
+function placeRect(s,dx){ const w=cover.dw*s, h=cover.dh*s; return { x:cover.ox+(cover.dw-w)/2+dx, y:cover.oy+cover.dh-h, w, h }; }
+function drawCut(canvas,s,dx,alpha,bright){
+  const r=placeRect(s,dx); ctx.save(); ctx.globalAlpha=alpha; if (bright!==1) ctx.filter=`brightness(${bright}) saturate(0.95)`;
+  ctx.translate(r.x+r.w,r.y); ctx.scale(-1,1); ctx.drawImage(canvas,0,0,r.w,r.h); ctx.restore();
+}
+function personScreen(s,dx){ // titik tengah orang pada clone
+  const r=placeRect(s,dx); return { x:r.x+(1-centroid.x)*r.w, y:r.y+centroid.y*r.h, w:r.w };
+}
+
+// ---------- smoke ----------
+const sprite=(()=>{ const c=document.createElement('canvas'); c.width=c.height=128; const x=c.getContext('2d');
+  const g=x.createRadialGradient(64,64,0,64,64,64); g.addColorStop(0,'rgba(255,255,255,1)'); g.addColorStop(0.45,'rgba(240,240,240,.55)'); g.addColorStop(1,'rgba(220,220,220,0)');
+  x.fillStyle=g; x.fillRect(0,0,128,128); return c; })();
+const smoke=[];
+function puff(x,y,size){
+  for (let i=0;i<48;i++){ const a=Math.random()*Math.PI*2, v=size*(0.8+Math.random()*2.2), rr=Math.random();
+    smoke.push({ x:x+Math.cos(a)*size*0.45*rr, y:y+Math.sin(a)*size*0.6*rr, vx:Math.cos(a)*v, vy:Math.sin(a)*v*0.8-size*0.3,
+      r:size*(0.18+Math.random()*0.22), gr:size*(0.5+Math.random()*0.6), age:0, life:0.7+Math.random()*0.6, rot:Math.random()*6 }); }
+}
+
+// asap "poof" kartun (orisinal): gumpalan bertepi tegas, bayangan bawah, kilau atas; muncul menghentak lalu menyusut
+function celSmoke(L){
+  const pass=(sc,dx,dy,col)=>{ ctx.fillStyle=col; ctx.beginPath(); for (const q of L){ const r=q.r*sc; if (r<1) continue; const x=q.x+dx*q.r, y=q.y+dy*q.r; ctx.moveTo(x+r,y); ctx.arc(x,y,r,0,7); } ctx.fill(); };
+  ctx.save(); ctx.globalAlpha=1;
+  pass(1.08, 0, 0.03, '#7c8590');     // tepi abu
+  pass(1.0, 0.05, 0.1, '#b9c2cc');    // bayangan bawah
+  pass(0.88,-0.04,-0.07,'#eef2f6');   // badan asap
+  pass(0.42,-0.28,-0.32,'#ffffff');   // kilau
+  // garis lengkung kecil di sebagian gumpalan
+  ctx.strokeStyle='#8d96a1'; ctx.lineCap='round';
+  for (const q of L){ if (q.id%11!==0 || q.r<28) continue; ctx.lineWidth=Math.max(1.5,q.r*0.07); ctx.beginPath(); ctx.arc(q.x+q.r*0.15,q.y+q.r*0.1,q.r*0.45,0.2*Math.PI,0.85*Math.PI); ctx.stroke(); }
+  ctx.restore();
+}
+let smokeId=0;
+function drawSmoke(dt){
+  const LS=[];
+  for (let i=smoke.length-1;i>=0;i--){ const p=smoke[i]; p.age+=dt; if (p.age>p.life){ smoke.splice(i,1); continue; }
+    const k=p.age/p.life; p.vx*=Math.pow(0.04,dt); p.vy*=Math.pow(0.04,dt); p.x+=p.vx*dt; p.y+=p.vy*dt; p.r+=p.gr*dt*(1-k);
+    if (p.id==null) p.id=smokeId++; const pop = k<0.12 ? 0.55+0.45*(k/0.12)*1.08 : 1, shrink = k>0.65 ? Math.max(0,1-(k-0.65)/0.35) : 1;
+    LS.push({ x:p.x, y:p.y, r:p.r*pop*shrink, id:p.id }); }
+  celSmoke(LS);
+  ctx.globalAlpha=1;
+}
+
+// ---------- state ----------
+const S={ active:false, hold:0, cool:0, clones:T.slots.map(()=>({ a:0, target:0, at:0 })), t:0, seal:{ok:false,why:''} };
+function cast(){
+  const on=!S.active; S.active=on; S.cool=T.cooldown; S.hold=0;
+  // urutan kemunculan: dalam dulu, lalu luar
+  const order=[2,3,0,1];
+  order.forEach((idx,n)=>{ const c=S.clones[idx]; c.at=S.t+0.1+n*0.12; c.target=on?1:0; c.fired=false; });
+}
+window.__S=S;
+
+// ---------- loop ----------
+let last=performance.now(), lastVid=-1, hs=[], fpsAcc=0,fpsN=0,fps=0;
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now; S.t+=dt;
+  fpsAcc+=dt; fpsN++; if (fpsAcc>0.5){ fps=Math.round(fpsN/fpsAcc); fpsAcc=0; fpsN=0; }
+  if (video.readyState>=2 && video.currentTime!==lastVid){
+    lastVid=video.currentTime; computeCover();
+    if (!frames.length) setupBuffers();
+    const ts=now;
+    if (hands){ const r=hands.detectForVideo(video,ts); hs=(r.landmarks||[]).map(analyse); }
+    if (seg) seg.segmentForVideo(video, ts, res=>{ const m=res.confidenceMasks?.[0]; if (m) pushCutout(m); });
+  }
+  // seal logic
+  S.seal=sealInfo(hs);
+  if (S.cool>0) S.cool-=dt;
+  else if (S.seal.ok){ if (S.hold===0) sfxSeal(); S.hold+=dt; if (S.hold>=T.holdSeal) cast(); }
+  else S.hold=Math.max(0,S.hold-dt*2);
+
+  // clones timeline
+  S.clones.forEach((c,i)=>{
+    if (!c.fired && c.at && S.t>=c.at){ c.fired=true; const sl=T.slots[i], p=personScreen(sl.s, sl.dx*W);
+      const ps=Math.min(p.w*0.32, W*0.22); puff(p.x,p.y,ps); puff(p.x,p.y+ps*0.9,ps*0.8); sfxPoof(0, 0.85+Math.random()*0.3); }
+    if (c.fired && S.t>=c.at+0.07) c.a += (c.target-c.a)*Math.min(1,dt*30);
+  });
+
+  // render
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  if (video.readyState>=2){
+    ctx.save(); ctx.translate(cover.ox+cover.dw,cover.oy); ctx.scale(-1,1); ctx.drawImage(video,0,0,cover.dw,cover.dh); ctx.restore();
+    const anyClone=S.clones.some(c=>c.a>0.01);
+    if (anyClone && frames.length && hasPerson){
+      [0,1,2,3].forEach(i=>{ const c=S.clones[i], sl=T.slots[i]; if (c.a>0.01) drawCut(frameAt(sl.delay), sl.s, sl.dx*W, c.a, sl.bright); });
+      drawCut(frameAt(0), 1, 0, 1, 1); // orang asli di depan bayangan
+    }
+  }
+  drawSmoke(dt);
+  if (showLm) hs.forEach(drawLm);
+
+  const label = S.cool>0 && S.active ? '' : S.seal.ok ? 'Tahan…' : (S.active ? 'Segel lagi untuk menghilangkan' : S.seal.why);
+  $label.textContent=label; $label.style.opacity=label?1:0;
+  $fill.style.width=Math.min(1,S.hold/T.holdSeal)*100+'%';
+  $stat.textContent=`${fps} fps · tangan ${hs.length} · ${hs.map(h=>h.two?'✌':'·').join(' ')} · orang ${hasPerson?'ya':'tidak'}`;
+  requestAnimationFrame(frame);
+}
+const BONES=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawLm(h){
+  ctx.strokeStyle=h.two?'rgba(255,179,71,.85)':'rgba(255,255,255,.5)'; ctx.lineWidth=2;
+  for (const [a,b] of BONES){ ctx.beginPath(); ctx.moveTo(h.pts[a].x,h.pts[a].y); ctx.lineTo(h.pts[b].x,h.pts[b].y); ctx.stroke(); }
+  ctx.strokeStyle='#ffb347'; ctx.lineWidth=5; ctx.beginPath(); ctx.moveTo(h.base.x,h.base.y); ctx.lineTo(h.tip.x,h.tip.y); ctx.stroke();
+  ctx.fillStyle='#fff'; ctx.font='bold 13px sans-serif'; ctx.fillText(h.ext.map(e=>e?'1':'0').join(''), h.pts[0].x+8, h.pts[0].y+16);
+}
+
+// ---------- boot ----------
+async function loadModels(){
+  $label.textContent='Memuat model…';
+  const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  hands=await HandLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" },
+    runningMode:"VIDEO", numHands:2, minHandDetectionConfidence:0.45, minHandPresenceConfidence:0.45, minTrackingConfidence:0.45 });
+  seg=await ImageSegmenter.createFromOptions(fs,{ baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite", delegate:"GPU" },
+    runningMode:"VIDEO", outputCategoryMask:false, outputConfidenceMasks:true });
+}
+document.getElementById('go').onclick=async()=>{
+  const err=document.getElementById('err'); err.textContent=''; initAudio();
+  try{
+    if (params.get('src')){ video.src=params.get('src'); }
+    else video.srcObject=await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+    await video.play(); await loadModels();
+    document.getElementById('start').classList.add('hide');
+    if (!running){ running=true; requestAnimationFrame(frame); }
+  }catch(e){ console.error(e); err.textContent='Gagal: '+(e.message||e.name); }
+};
+addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if (k==='h'){ showHud=!showHud; document.getElementById('hud').classList.toggle('hide',!showHud); }
+  if (k==='l') showLm=!showLm;
+  if (k==='k') cast();
+  if (k==='r'){ S.active=false; S.clones.forEach(c=>{c.a=0;c.target=0;c.at=0;c.fired=true;}); }
+});
+</script>
+<script src="../shared/clouds.js"></script>
+<script src="../shared/start.js"></script>
+</body>
+</html>

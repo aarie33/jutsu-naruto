@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mata Segi Delapan</title>
+<style>
+  :root { --c:#8fdcff; --ink:#eef8ff; }
+  html,body { margin:0; height:100%; background:#05080b; overflow:hidden;
+    font-family: ui-sans-serif, -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif; color:var(--ink); }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  video { display:none; }
+  #hud { position:fixed; inset:0; pointer-events:none; }
+  #label { position:absolute; top:5vh; left:0; right:0; text-align:center; font-weight:800; letter-spacing:.14em;
+    font-size:clamp(14px,2.4vw,26px); text-transform:uppercase; text-shadow:0 2px 18px rgba(0,0,0,.85); transition:opacity .25s; }
+  #bar { position:absolute; bottom:6vh; left:50%; transform:translateX(-50%); width:min(46vw,420px); height:8px; border-radius:8px; background:rgba(255,255,255,.12); overflow:hidden; }
+  #fill { height:100%; width:0%; background:linear-gradient(90deg,#5d7a92,var(--c),#fff); box-shadow:0 0 18px var(--c); }
+  #stat { position:absolute; bottom:2vh; left:0; right:0; text-align:center; font-size:12px; opacity:.45; letter-spacing:.1em; }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../shared/start.css">
+</head>
+<body>
+<video id="cam" playsinline muted loop></video>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="label">Memuat…</div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="stat"></div>
+</div>
+<div id="start" style="--accent:#8fdcff">
+  <div class="st-wrap">
+    <header class="st-head">
+      <h1 class="st-title">Mata Segi Delapan</h1>
+      <p class="st-lede">Iris bersisi delapan dan logam yang menempel di wajahmu.</p>
+    </header>
+    <ol class="st-steps"><li><p><b>Gabungkan kedua tangan</b><span>di depan dada.</span></p></li><li><p><b>Dua jari ke atas</b><span>di masing-masing tangan, lalu tahan.</span></p></li><li><p><b>Ulangi gerakan</b><span>untuk kembali normal.</span></p></li></ol>
+    <div class="st-actions">
+      <div class="st-row">
+        <button id="go" class="st-go" type="button"><span class="st-label">Mulai kamera</span><svg class="st-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><svg class="st-spin" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-opacity=".3" stroke-width="2.5"/><path d="M17.5 10A7.5 7.5 0 0 0 10 2.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></button>
+        
+      </div>
+      <p class="st-privacy"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.5"/></svg>Kamera diproses langsung di perangkatmu. Tidak ada video yang dikirim.</p>
+      <p id="err" role="alert"></p>
+    </div>
+    <footer class="st-keys"><span><kbd>H</kbd>sembunyikan HUD</span><span><kbd>L</kbd>titik tangan</span><span><kbd>K</kbd>paksa jutsu</span><span><kbd>R</kbd>reset</span><span><kbd>C</kbd>awan</span></footer>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, FaceLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- tunables ----------
+const T = {
+  holdGesture: 0.6,   // detik gesture ditahan
+  upCos: 0.7,         // seberapa tegak jarinya
+  joinDist: 1.8,      // jarak dua telapak maksimal (× ukuran tangan) supaya dianggap bergabung
+  cooldown: 1.5,
+  eyeSpin: 0.25,      // kecepatan putar iris (rad/detik)
+  earMinTurn: 0.28,   // anting disembunyikan kalau sisi wajah itu terlalu menghadap samping
+};
+const params = new URLSearchParams(location.search);
+const TS = +params.get('ts') || 1;
+const clamp01 = v => Math.max(0, Math.min(1, v));
+const ease = v => v*v*(3-2*v);
+const easeOutBack = v => { const c=2.2; return 1 + (c+1)*Math.pow(v-1,3) + c*Math.pow(v-1,2); };
+
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const video=document.getElementById('cam');
+const $label=document.getElementById('label'), $stat=document.getElementById('stat'), $fill=document.getElementById('fill');
+let W=0,H=0;
+function resize(){ W=innerWidth; H=innerHeight; cv.width=W; cv.height=H; }
+addEventListener('resize',resize); resize();
+let hands=null, face=null, showHud=true, showLm=false, running=false;
+
+// ---------- audio ----------
+let A=null;
+function initAudio(){ if (A) return; const ac=new (window.AudioContext||window.webkitAudioContext)();
+  const master=ac.createGain(); master.gain.value=0.9; master.connect(ac.destination);
+  const buf=ac.createBuffer(1,ac.sampleRate,ac.sampleRate), d=buf.getChannelData(0); for (let i=0;i<d.length;i++) d[i]=Math.random()*2-1;
+  A={ac,master,buf}; }
+const tone=(dt,len,type,f0,f1,vol)=>{ if (!A) return; const ac=A.ac,t=ac.currentTime+dt, o=ac.createOscillator(); o.type=type; o.frequency.setValueAtTime(f0,t); o.frequency.exponentialRampToValueAtTime(f1,t+len);
+  const g=ac.createGain(); g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(vol,t+0.01); g.gain.exponentialRampToValueAtTime(0.001,t+len); o.connect(g); g.connect(A.master); o.start(t); o.stop(t+len+0.05); };
+const noise=(dt,len,f0,f1,vol)=>{ if (!A) return; const ac=A.ac,t=ac.currentTime+dt, n=ac.createBufferSource(); n.buffer=A.buf; const f=ac.createBiquadFilter(); f.type='bandpass'; f.Q.value=1;
+  f.frequency.setValueAtTime(f0,t); f.frequency.exponentialRampToValueAtTime(f1,t+len); const g=ac.createGain(); g.gain.setValueAtTime(vol,t); g.gain.exponentialRampToValueAtTime(0.001,t+len); n.connect(f); f.connect(g); g.connect(A.master); n.start(t); n.stop(t+len+0.05); };
+const sfxOpen=()=>{ tone(0,1.2,'sine',220,110,0.35); tone(0,0.9,'sine',1760,3520,0.12); noise(0,0.6,3000,800,0.2); };
+const sfxTink=(p=1)=>{ tone(0,0.35,'triangle',2600*p,2500*p,0.18); tone(0,0.25,'sine',5200*p,5100*p,0.06); };
+const sfxClose=()=>{ tone(0,0.6,'sine',660,220,0.2); noise(0,0.4,1200,300,0.15); };
+
+// ---------- tracking ----------
+let cover={s:1,ox:0,oy:0,dw:1,dh:1,vw:1280,vh:720};
+function computeCover(){ const vw=video.videoWidth||1280, vh=video.videoHeight||720, s=Math.max(W/vw,H/vh); cover={s,vw,vh,dw:vw*s,dh:vh*s,ox:(W-vw*s)/2,oy:(H-vh*s)/2}; }
+const toScreen = l => ({ x:cover.ox+(1-l.x)*cover.dw, y:cover.oy+l.y*cover.dh });
+const FINGERS=[[8,6],[12,10],[16,14],[20,18]], PALM=[0,5,9,13,17];
+function analyseHand(lms){
+  const {vw,vh}=cover, p3=i=>({x:lms[i].x*vw,y:lms[i].y*vh,z:lms[i].z*vw}), d3=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);
+  const w=p3(0), ext=FINGERS.map(([t,p])=>d3(w,p3(t))>d3(w,p3(p))*1.12);
+  const pts=lms.map(toScreen); let cx=0,cy=0; for (const i of PALM){ cx+=pts[i].x; cy+=pts[i].y; }
+  const base={x:(pts[5].x+pts[9].x)/2,y:(pts[5].y+pts[9].y)/2}, tip={x:(pts[8].x+pts[12].x)/2,y:(pts[8].y+pts[12].y)/2};
+  const len=Math.hypot(tip.x-base.x,tip.y-base.y)||1;
+  const two=ext[0]&&ext[1]&&(ext[2]+ext[3])<=1, up=-(tip.y-base.y)/len>T.upCos;
+  return { pts, ext, cx:cx/5, cy:cy/5, size:Math.hypot(pts[0].x-pts[9].x,pts[0].y-pts[9].y), ok:two&&up };
+}
+// dua tangan bergabung, masing-masing dua jari ke atas
+function gestureOK(hs){ if (hs.length<2) return false; const [a,b]=hs; if (!a.ok||!b.ok) return false;
+  return Math.hypot(a.cx-b.cx, a.cy-b.cy) < T.joinDist*(a.size+b.size)/2; }
+const L_EYE=[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246], R_EYE=[263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466];
+let F=null;
+function analyseFace(lms){ const P=i=>toScreen(lms[i]);
+  const fw=Math.hypot(P(234).x-P(454).x, P(234).y-P(454).y), nose=P(1);
+  const eyes=[[468,469,L_EYE],[473,474,R_EYE]].map(([c,r,ring])=>{ const cc=P(c); return { c:cc, r:Math.hypot(P(r).x-cc.x,P(r).y-cc.y), poly:ring.map(P) }; });
+  // arah kepala (sumbu) untuk menurunkan posisi telinga
+  const top=P(10), chin=P(152), dn={x:(chin.x-top.x), y:(chin.y-top.y)}, dl=Math.hypot(dn.x,dn.y)||1; dn.x/=dl; dn.y/=dl;
+  return { P, fw, nose, eyes, dn, sideA:Math.abs(nose.x-P(234).x)/fw, sideB:Math.abs(P(454).x-nose.x)/fw };
+}
+
+// ---------- mata segi delapan (desain orisinal) ----------
+// iris = satu oktagon bersisi seperti permata potong: 8 faset dari pupil ke sudut, pupil bintang 8 sudut
+function octPts(cx,cy,R,rot){ const o=[]; for (let i=0;i<8;i++){ const a=rot+Math.PI/8+i*Math.PI/4; o.push([cx+Math.cos(a)*R, cy+Math.sin(a)*R]); } return o; }
+function drawOctEye(e, k, rot, t){
+  if (k<=0.01) return; const {c,r}=e, R=r*1.12*(0.35+0.65*easeOutBack(Math.min(1,k))), O=octPts(c.x,c.y,R,rot);
+  ctx.save(); ctx.beginPath(); e.poly.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.closePath(); ctx.clip();
+  ctx.globalAlpha=Math.min(1,k*1.3);
+  // isi baja dingin
+  let g=ctx.createRadialGradient(c.x,c.y-R*0.15,R*0.05,c.x,c.y,R); g.addColorStop(0,'#e9f8ff'); g.addColorStop(0.45,'#9fb6c8'); g.addColorStop(0.85,'#4a5d6e'); g.addColorStop(1,'#1b2530');
+  ctx.fillStyle=g; ctx.beginPath(); O.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1])); ctx.closePath(); ctx.fill();
+  // faset: segitiga terang-gelap bergantian
+  for (let i=0;i<8;i++){ const a=O[i], b=O[(i+1)%8]; ctx.fillStyle = i%2 ? 'rgba(255,255,255,0.10)' : 'rgba(0,10,25,0.16)';
+    ctx.beginPath(); ctx.moveTo(c.x,c.y); ctx.lineTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.closePath(); ctx.fill(); }
+  ctx.strokeStyle='rgba(12,20,30,0.85)'; ctx.lineWidth=Math.max(1,R*0.05);
+  for (const p of O){ ctx.beginPath(); ctx.moveTo(c.x+(p[0]-c.x)*0.28, c.y+(p[1]-c.y)*0.28); ctx.lineTo(p[0],p[1]); ctx.stroke(); }
+  ctx.lineWidth=Math.max(1,R*0.09); ctx.beginPath(); O.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1])); ctx.closePath(); ctx.stroke();
+  // pupil bintang 8 sudut
+  ctx.fillStyle='#070b10'; ctx.beginPath();
+  for (let i=0;i<16;i++){ const a=-rot*1.6+i*Math.PI/8, rr=i%2?R*0.11:R*0.27; const X=c.x+Math.cos(a)*rr, Y=c.y+Math.sin(a)*rr; i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); }
+  ctx.closePath(); ctx.fill();
+  ctx.globalCompositeOperation='lighter'; ctx.fillStyle=`rgba(150,225,255,${0.7+0.3*Math.sin(t*3)})`; ctx.beginPath(); ctx.arc(c.x,c.y,R*0.06,0,7); ctx.fill();
+  // kilatan retak saat terbuka
+  if (k<1){ ctx.strokeStyle=`rgba(230,250,255,${1-k})`; ctx.lineWidth=Math.max(1,R*0.06); for (const p of O){ ctx.beginPath(); ctx.moveTo(c.x,c.y); ctx.lineTo(c.x+(p[0]-c.x)*1.4, c.y+(p[1]-c.y)*1.4); ctx.stroke(); } }
+  ctx.restore();
+  ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.globalAlpha=0.45*Math.min(1,k);
+  g=ctx.createRadialGradient(c.x,c.y,0,c.x,c.y,R*3); g.addColorStop(0,'rgba(140,215,255,.8)'); g.addColorStop(1,'rgba(80,160,255,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(c.x,c.y,R*3,0,7); ctx.fill(); ctx.restore();
+}
+
+// ---------- tindikan logam ----------
+function stud(x,y,r,a){ if (a<=0.01) return; ctx.save(); ctx.globalAlpha=a;
+  ctx.fillStyle='rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.arc(x+r*0.15,y+r*0.25,r*1.05,0,7); ctx.fill();
+  const g=ctx.createRadialGradient(x-r*0.35,y-r*0.4,r*0.05,x,y,r); g.addColorStop(0,'#ffffff'); g.addColorStop(0.35,'#d7dde3'); g.addColorStop(0.75,'#7d8791'); g.addColorStop(1,'#3a4148');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill(); ctx.restore(); }
+function hoop(x,y,r,a0,a1,th,a){ if (a<=0.01) return; ctx.save(); ctx.globalAlpha=a; ctx.lineCap='round';
+  ctx.strokeStyle='rgba(0,0,0,0.35)'; ctx.lineWidth=th*1.2; ctx.beginPath(); ctx.arc(x+th*0.2,y+th*0.3,r,a0,a1); ctx.stroke();
+  const g=ctx.createLinearGradient(x-r,y-r,x+r,y+r); g.addColorStop(0,'#f4f7fa'); g.addColorStop(0.5,'#8d98a3'); g.addColorStop(1,'#dfe5ea');
+  ctx.strokeStyle=g; ctx.lineWidth=th; ctx.beginPath(); ctx.arc(x,y,r,a0,a1); ctx.stroke();
+  ctx.strokeStyle='rgba(255,255,255,0.8)'; ctx.lineWidth=th*0.3; ctx.beginPath(); ctx.arc(x,y,r,a0+0.3,a0+(a1-a0)*0.45); ctx.stroke(); ctx.restore(); }
+// daftar tindikan + urutan munculnya
+const PIERCE = [
+  { o:0.00, draw:(f,a)=>{ const p=f.P(2); hoop(p.x, p.y+f.fw*0.035, f.fw*0.05, 0.15*Math.PI, 0.85*Math.PI, f.fw*0.014, a); } },     // cincin sekat hidung
+  { o:0.12, draw:(f,a)=>{ const p=f.P(294); stud(p.x, p.y, f.fw*0.014, a); } },                                                   // stud cuping hidung
+  ...[[234,'sideA'],[454,'sideB']].flatMap(([lm,side],j)=>[
+    { o:0.24+j*0.12, ear:side, draw:(f,a)=>{ const p=f.P(lm), out=lm===234?-1:1, x=p.x+out*f.fw*0.025+f.dn.x*f.fw*0.17, y=p.y+f.dn.y*f.fw*0.17;
+        hoop(x, y+f.fw*0.03, f.fw*0.035, 0, Math.PI*2, f.fw*0.011, a); } },                                                       // anting cuping telinga
+    { o:0.30+j*0.12, ear:side, draw:(f,a)=>{ const p=f.P(lm), out=lm===234?-1:1; stud(p.x+out*f.fw*0.03-f.dn.x*f.fw*0.02, p.y-f.dn.y*f.fw*0.02, f.fw*0.011, a);
+        stud(p.x+out*f.fw*0.025-f.dn.x*f.fw*0.09, p.y-f.dn.y*f.fw*0.09, f.fw*0.01, a); } },                                       // stud tulang telinga
+  ]),
+];
+
+// ---------- state ----------
+const S={ on:false, hold:0, cool:0, t:0, t0:-99, tOff:-99, ev:{} };
+window.__S=S;
+function once(k,fn){ if (!S.ev[k]){ S.ev[k]=true; fn(); } }
+function toggle(){ S.cool=T.cooldown; S.hold=0;
+  if (!S.on){ S.on=true; S.t0=S.t; S.ev={}; sfxOpen(); } else { S.on=false; S.tOff=S.t; sfxClose(); } }
+
+// ---------- loop ----------
+let last=performance.now(), lastVid=-1, hs=[], fpsAcc=0,fpsN=0,fps=0, flash=0;
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000)*TS; last=now; S.t+=dt; const t=S.t;
+  fpsAcc+=dt/TS; fpsN++; if (fpsAcc>0.5){ fps=Math.round(fpsN/fpsAcc); fpsAcc=0; fpsN=0; }
+  if (video.readyState>=2 && video.currentTime!==lastVid){
+    lastVid=video.currentTime; computeCover();
+    if (hands) hs=(hands.detectForVideo(video,now).landmarks||[]).map(analyseHand);
+    if (face){ const r=face.detectForVideo(video,now); F=r.faceLandmarks?.[0]?analyseFace(r.faceLandmarks[0]):null; }
+  }
+  const g=gestureOK(hs);
+  if (S.cool>0) S.cool-=dt; else if (g){ S.hold+=dt; if (S.hold>=T.holdGesture) toggle(); } else S.hold=Math.max(0,S.hold-dt*2);
+
+  const since=t-S.t0, out=t-S.tOff;
+  const eyeK = S.on ? clamp01(since/0.6) : clamp01(1-out/0.5);
+  const pk = S.on ? clamp01((since-0.6)/0.9) : clamp01(1-out/0.4);
+  if (S.on && since<0.15) flash=Math.max(flash,0.35);
+  if (S.on) PIERCE.forEach((p,i)=>{ if (pk>p.o) once('p'+i, ()=>sfxTink(0.9+i*0.06)); });
+
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+  if (video.readyState>=2){
+    ctx.save(); ctx.translate(cover.ox+cover.dw, cover.oy); ctx.scale(-1,1); ctx.drawImage(video,0,0,cover.dw,cover.dh); ctx.restore();
+    if (eyeK>0){ ctx.fillStyle=`rgba(4,10,18,${0.18*eyeK})`; ctx.fillRect(0,0,W,H); }   // nuansa dingin
+    if (F){
+      F.eyes.forEach(e=>drawOctEye(e, eyeK, t*T.eyeSpin, t));
+      for (const p of PIERCE){ let a = clamp01((pk-p.o)/0.12); if (a<=0) continue;
+        if (p.ear) a *= clamp01((F[p.ear]-T.earMinTurn)/0.1);
+        const pop = S.on ? easeOutBack(a) : a; ctx.save(); p.draw(F, Math.min(1,pop)); ctx.restore(); }
+    }
+  }
+  if (showLm) hs.forEach(drawHand);
+  if (flash>0){ ctx.fillStyle=`rgba(210,240,255,${flash})`; ctx.fillRect(0,0,W,H); flash=Math.max(0,flash-dt*2.5); }
+
+  const lab = S.on ? (since<1.6 ? '' : 'Ulangi gerakan untuk kembali normal') : g ? 'Tahan…' : !F ? 'Wajah belum terdeteksi' : 'Gabungkan tangan, dua jari ke atas';
+  $label.textContent=lab; $label.style.opacity=lab?1:0;
+  $fill.style.width=Math.min(1,S.hold/T.holdGesture)*100+'%';
+  $stat.textContent=`${fps} fps · tangan ${hs.length} ${hs.map(h=>h.ok?'☝':'·').join('')} · wajah ${F?'ya':'tidak'}`;
+  requestAnimationFrame(frame);
+}
+const HB=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawHand(h){ ctx.strokeStyle=h.ok?'rgba(143,220,255,.9)':'rgba(255,255,255,.5)'; ctx.lineWidth=2;
+  for (const [a,b] of HB){ ctx.beginPath(); ctx.moveTo(h.pts[a].x,h.pts[a].y); ctx.lineTo(h.pts[b].x,h.pts[b].y); ctx.stroke(); }
+  ctx.fillStyle='#fff'; ctx.font='bold 13px sans-serif'; ctx.fillText(h.ext.map(e=>e?'1':'0').join(''), h.pts[0].x+8, h.pts[0].y+16); }
+
+// ---------- boot ----------
+async function loadModels(){
+  $label.textContent='Memuat model…';
+  const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const M="https://storage.googleapis.com/mediapipe-models/";
+  [hands, face] = await Promise.all([
+    HandLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" }, runningMode:"VIDEO", numHands:2 }),
+    FaceLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate:"GPU" }, runningMode:"VIDEO", numFaces:1 }),
+  ]);
+}
+document.getElementById('go').onclick=async()=>{
+  const err=document.getElementById('err'); err.textContent=''; initAudio();
+  try{
+    if (params.get('src')) video.src=params.get('src');
+    else video.srcObject=await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+    await video.play(); await loadModels();
+    document.getElementById('start').classList.add('hide');
+    if (!running){ running=true; requestAnimationFrame(frame); }
+  }catch(e){ console.error(e); err.textContent='Gagal: '+(e.message||e.name); }
+};
+addEventListener('keydown',e=>{ const k=e.key.toLowerCase();
+  if (k==='h'){ showHud=!showHud; document.getElementById('hud').classList.toggle('hide',!showHud); }
+  if (k==='l') showLm=!showLm;
+  if (k==='k' && S.cool<=0) toggle();
+  if (k==='r'){ S.on=false; S.tOff=S.t-5; } });
+</script>
+<script src="../shared/clouds.js"></script>
+<script src="../shared/start.js"></script>
+</body>
+</html>

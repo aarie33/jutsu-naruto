@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Jutsu Kamera</title>
+<meta name="description" content="Efek jutsu yang jalan langsung di browser lewat kamera. Fan-made, tanpa instalasi.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400..700&display=swap" rel="stylesheet">
+<style>
+  :root { --ink:#f3f1ec; --bg:#0b0b0c; --muted:color-mix(in oklab, var(--ink) 60%, var(--bg)); --line:color-mix(in oklab, var(--ink) 12%, var(--bg)); }
+  * { box-sizing:border-box; }
+  html { background:var(--bg); color-scheme:dark; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--ink); font:400 16px/1.55 "Figtree", ui-sans-serif, system-ui, sans-serif; -webkit-font-smoothing:antialiased; }
+  ::selection { background:#ff8a2a; color:#0b0b0c; }
+  main { width:min(1040px, 100% - 32px); margin:0 auto; padding:clamp(48px, 9vw, 120px) 0 56px; }
+  h1 { margin:0; font:800 clamp(3rem, 9vw, 6rem)/0.92 "Bricolage Grotesque", sans-serif; letter-spacing:-0.035em; text-wrap:balance; }
+  .lede { margin:22px 0 0; max-width:44ch; font-size:clamp(1.05rem, 1.7vw, 1.3rem); color:var(--muted); text-wrap:pretty; }
+  .list { list-style:none; margin:clamp(48px, 7vw, 80px) 0 0; padding:0; border-top:1px solid var(--line); }
+  .list a {
+    --a:#fff; display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1.3fr) 24px; align-items:center; gap:8px 32px;
+    padding:26px 4px; border-bottom:1px solid var(--line); color:inherit; text-decoration:none;
+    transition:background .3s cubic-bezier(.16,1,.3,1), padding .3s cubic-bezier(.16,1,.3,1);
+  }
+  .list a:hover { background:color-mix(in oklab, var(--a) 6%, var(--bg)); padding-left:16px; padding-right:16px; }
+  .list a:focus-visible { outline:2px solid var(--a); outline-offset:-2px; }
+  .name { display:flex; align-items:center; gap:14px; font:700 clamp(1.5rem, 3vw, 2.1rem)/1.05 "Bricolage Grotesque", sans-serif; letter-spacing:-0.02em; }
+  .name::before { content:""; flex:none; width:10px; height:10px; border-radius:50%; background:var(--a); }
+  .how { color:var(--muted); }
+  .list svg { width:22px; height:22px; color:var(--muted); transition:transform .3s cubic-bezier(.16,1,.3,1), color .2s; }
+  .list a:hover svg { transform:translateX(4px); color:var(--a); }
+  .note { margin:40px 0 0; display:grid; gap:10px; max-width:70ch; font-size:.9rem; color:var(--muted); }
+  .note p { margin:0; }
+  @media (max-width: 680px) {
+    .list a { grid-template-columns:minmax(0, 1fr) 22px; }
+    .how { grid-column:1; grid-row:2; font-size:.95rem; }
+    .list svg { grid-row:1 / span 2; grid-column:2; }
+    .list a:hover { padding-left:4px; padding-right:4px; }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    h1 { animation: rise .9s cubic-bezier(.16,1,.3,1) both; }
+    @keyframes rise { from { clip-path: inset(0 0 100% 0); transform: translateY(18px); } to { clip-path: inset(0 0 -10% 0); transform: none; } }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Jutsu Kamera</h1>
+  <p class="lede">Efek jutsu yang jalan langsung di browser. Buka, izinkan kamera, lalu peragakan gerakannya.</p>
+
+  <ul class="list">
+    <li><a href="rasengan/" style="--a:#7fd8ff"><span class="name">Rasengan</span><span class="how">Buka telapak, putar tangan satunya, lalu dorong ke kamera.</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+    <li><a href="kagebunshin/" style="--a:#ffb347"><span class="name">Kage Bunshin</span><span class="how">Silangkan dua jari dari kedua tangan untuk memanggil bayangan.</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+    <li><a href="kuchiyose/" style="--a:#3ce6aa"><span class="name">Kuchiyose</span><span class="how">Tepuk telapak ke bawah untuk memanggil katak roh di sampingmu.</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+    <li><a href="susanoo/" style="--a:#a774ff"><span class="name">Susanoo</span><span class="how">Dua jari menunjuk ke atas, raksasa berzirah bangkit di belakangmu.</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+    <li><a href="bolaapi/" style="--a:#ff8a2a"><span class="name">Bola Api</span><span class="how">Tiga segel berurutan, lalu buka mulut untuk menyemburkan api.</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+    <li><a href="segi8/" style="--a:#8fdcff"><span class="name">Mata Segi Delapan</span><span class="how">Gabungkan kedua tangan, dua jari ke atas, untuk mengubah matamu.</span><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></li>
+  </ul>
+
+  <div class="note">
+    <p>Kamera diproses langsung di perangkatmu. Tidak ada video yang dikirim atau disimpan.</p>
+    <p>Proyek fan-made untuk hiburan. Tidak berafiliasi dengan pemilik franchise Naruto. Semua efek dan desain visual dibuat sendiri.</p>
+  </div>
+</main>
+</body>
+</html>

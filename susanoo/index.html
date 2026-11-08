@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Susanoo Detector</title>
+<style>
+  :root { --c:#9646ff; --ink:#f6efff; }
+  html,body { margin:0; height:100%; background:#06040a; overflow:hidden;
+    font-family: ui-sans-serif, -apple-system, "SF Pro Display", "Helvetica Neue", Arial, sans-serif; color:var(--ink); }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  video { display:none; }
+  #hud { position:fixed; inset:0; pointer-events:none; }
+  #label { position:absolute; top:5vh; left:0; right:0; text-align:center; font-weight:800; letter-spacing:.14em;
+    font-size:clamp(14px,2.4vw,26px); text-transform:uppercase; text-shadow:0 2px 18px rgba(0,0,0,.85); transition:opacity .25s; }
+  #bar { position:absolute; bottom:6vh; left:50%; transform:translateX(-50%); width:min(46vw,420px); height:8px;
+    border-radius:8px; background:rgba(255,255,255,.12); overflow:hidden; }
+  #fill { height:100%; width:0%; background:linear-gradient(90deg,#ff2a3a,var(--c),#fff); box-shadow:0 0 18px var(--c); }
+  #stat { position:absolute; bottom:2vh; left:0; right:0; text-align:center; font-size:12px; opacity:.45; letter-spacing:.1em; }
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600..800&family=Figtree:wght@400..700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../shared/start.css">
+</head>
+<body>
+<video id="cam" playsinline muted loop></video>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div id="label">Memuat…</div>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="stat"></div>
+</div>
+<div id="start" style="--accent:#a774ff">
+  <div class="st-wrap">
+    <header class="st-head">
+      <h1 class="st-title">Susanoo</h1>
+      <p class="st-lede">Raksasa rangka berzirah bangkit di belakangmu.</p>
+    </header>
+    <ol class="st-steps"><li><p><b>Angkat satu tangan</b><span>Telunjuk dan jari tengah menunjuk ke atas.</span></p></li><li><p><b>Tahan sebentar</b><span>Sisakan ruang kosong di atas kepalamu.</span></p></li><li><p><b>Ulangi gerakan</b><span>untuk menonaktifkan.</span></p></li></ol>
+    <div class="st-actions">
+      <div class="st-row">
+        <button id="go" class="st-go" type="button"><span class="st-label">Mulai kamera</span><svg class="st-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-4-5 5 5-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><svg class="st-spin" viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="7.5" stroke="currentColor" stroke-opacity=".3" stroke-width="2.5"/><path d="M17.5 10A7.5 7.5 0 0 0 10 2.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg></button>
+        
+      </div>
+      <p class="st-privacy"><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.5"/></svg>Kamera diproses langsung di perangkatmu. Tidak ada video yang dikirim.</p>
+      <p id="err" role="alert"></p>
+    </div>
+    <footer class="st-keys"><span><kbd>1–3</kbd>warna</span><span><kbd>H</kbd>sembunyikan HUD</span><span><kbd>L</kbd>titik tangan</span><span><kbd>K</kbd>paksa jutsu</span><span><kbd>R</kbd>reset</span></footer>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, ImageSegmenter, FaceLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- tunables ----------
+const T = {
+  holdGesture: 0.6,   // detik gesture ditahan
+  upCos: 0.75,        // seberapa tegak jarinya (1 = lurus vertikal)
+  cooldown: 1.5,
+  build: 3.4,         // detik rangka tumbuh sampai lengkap
+  giantFace: 1.0,     // lebar tengkorak ÷ lebar wajahmu (naikkan = raksasa lebih besar)
+  maxSpan: 1.0,       // batas lebar total (ujung pedang ke ujung pedang) relatif lebar layar
+  giantLift: 0.0,     // naikkan kalau tengkorak masih ketutup kepalamu
+  bodyAlpha: 0.32,    // isi tulang tembus pandang (0 = cuma garis, 1 = solid)
+  armorBuild: 2.6,    // detik zirah merakit diri (setelah rangka lengkap)
+  armorAlpha: 0.85,   // kepekatan zirah (1 = solid, makin kecil makin tembus)
+  armorShade: 0.26,   // kegelapan warna zirah (0 = hitam, 1 = seterang cahaya)
+  boneDim: 0.45,      // seberapa redup tulang setelah tertutup zirah
+  sweep: true,        // satu ayunan pedang halus setelah lengan terbuka (false = tanpa ayunan)
+  maskLo: 0.35, maskHi: 0.75,
+};
+const PALETTES = {
+  '1': { glow:[150,70,255],  core:[240,225,255], name:'ungu'  },
+  '2': { glow:[255,40,50],   core:[255,220,210], name:'merah' },
+  '3': { glow:[50,140,255],  core:[215,238,255], name:'biru'  },
+};
+const params = new URLSearchParams(location.search);
+let PAL = PALETTES[params.get('c')] || PALETTES['1'];
+const TS = +params.get('ts') || 1;   // pengali waktu (hanya untuk tes)
+const rgba = (c,a)=>`rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const clamp01 = v => Math.max(0, Math.min(1, v));
+const ease = v => v*v*(3-2*v);
+const easeOut = v => 1-Math.pow(1-v,3);
+
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const video=document.getElementById('cam');
+const $label=document.getElementById('label'), $fill=document.getElementById('fill'), $stat=document.getElementById('stat');
+let W=0,H=0,DPR=1;
+const off = () => { const c=document.createElement('canvas'); return [c, c.getContext('2d')]; };
+const L = {}; for (const k of ['sk','skT','body','bodyT','aura','armor','armorT','armorD']) { const [c,x]=off(); L[k]={c,x}; }
+const [cutC,cutX]=off(), [maskC,maskX0]=off();
+function resize(){ DPR=Math.min(devicePixelRatio||1,2); W=innerWidth; H=innerHeight; cv.width=W*DPR; cv.height=H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0);
+  for (const k in L){ L[k].c.width=Math.round(W/2); L[k].c.height=Math.round(H/2); } }
+addEventListener('resize',resize); resize();
+
+let hands=null, seg=null, face=null, showHud=true, showLm=false, running=false;
+
+// ---------- audio (disintesis) ----------
+let A=null;
+function initAudio(){
+  if (A) return;
+  const ac=new (window.AudioContext||window.webkitAudioContext)();
+  const master=ac.createGain(); master.gain.value=0.9; master.connect(ac.destination);
+  const buf=ac.createBuffer(1,ac.sampleRate*2,ac.sampleRate), d=buf.getChannelData(0); for (let i=0;i<d.length;i++) d[i]=Math.random()*2-1;
+  const o1=ac.createOscillator(), o2=ac.createOscillator(), o3=ac.createOscillator();
+  o1.type=o2.type='sawtooth'; o3.type='sine'; o1.frequency.value=55; o2.frequency.value=55.7; o3.frequency.value=27.5;
+  const lp=ac.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=420; lp.Q.value=3;
+  const drone=ac.createGain(); drone.gain.value=0;
+  o1.connect(lp); o2.connect(lp); o3.connect(drone); lp.connect(drone); drone.connect(master); o1.start(); o2.start(); o3.start();
+  const ns=ac.createBufferSource(); ns.buffer=buf; ns.loop=true;
+  const bp=ac.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=700; bp.Q.value=0.6;
+  const fire=ac.createGain(); fire.gain.value=0; ns.connect(bp); bp.connect(fire); fire.connect(master); ns.start();
+  A={ac,master,buf,drone,fire,lp};
+}
+function audioLevel(I, k){ if (!A) return; const t=A.ac.currentTime;
+  A.drone.gain.setTargetAtTime(0.2*I+0.08*k,t,0.15); A.fire.gain.setTargetAtTime((0.07+0.07*k)*I*(0.7+0.3*Math.random()),t,0.05);
+  A.lp.frequency.setTargetAtTime(300+500*I+400*k,t,0.2); }
+function sfxShing(){ if (!A) return; const ac=A.ac,t=ac.currentTime;
+  const o=ac.createOscillator(); o.type='sine'; o.frequency.setValueAtTime(2400,t); o.frequency.exponentialRampToValueAtTime(5200,t+0.25);
+  const g=ac.createGain(); g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.22,t+0.02); g.gain.exponentialRampToValueAtTime(0.001,t+0.7);
+  o.connect(g); g.connect(A.master); o.start(t); o.stop(t+0.8); }
+function sfxWhoosh(len=0.9, f0=300, f1=2400, vol=0.3){ if (!A) return; const ac=A.ac,t=ac.currentTime;
+  const n=ac.createBufferSource(); n.buffer=A.buf; const f=ac.createBiquadFilter(); f.type='bandpass'; f.Q.value=1.2;
+  f.frequency.setValueAtTime(f0,t); f.frequency.exponentialRampToValueAtTime(f1,t+len);
+  const g=ac.createGain(); g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(vol,t+len*0.7); g.gain.exponentialRampToValueAtTime(0.001,t+len+0.2);
+  n.connect(f); f.connect(g); g.connect(A.master); n.start(t); n.stop(t+len+0.3); }
+function sfxCrack(){ if (!A) return; const ac=A.ac,t=ac.currentTime;   // bunyi tulang "krak"
+  const n=ac.createBufferSource(); n.buffer=A.buf; const f=ac.createBiquadFilter(); f.type='bandpass'; f.frequency.value=1800; f.Q.value=3;
+  const g=ac.createGain(); g.gain.setValueAtTime(0.35,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.12); n.connect(f); f.connect(g); g.connect(A.master); n.start(t); n.stop(t+0.15); }
+function sfxClank(p=1){ if (!A) return; const ac=A.ac,t=ac.currentTime;
+  for (const fr of [190,287,451]){ const o=ac.createOscillator(); o.type='triangle'; o.frequency.value=fr*p;
+    const g=ac.createGain(); g.gain.setValueAtTime(0.12,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.6); o.connect(g); g.connect(A.master); o.start(t); o.stop(t+0.7); }
+  sfxCrack(); }
+function sfxBoom(){ if (!A) return; const ac=A.ac,t=ac.currentTime;
+  const o=ac.createOscillator(); o.type='sine'; o.frequency.setValueAtTime(110,t); o.frequency.exponentialRampToValueAtTime(30,t+1.2);
+  const g=ac.createGain(); g.gain.setValueAtTime(0.9,t); g.gain.exponentialRampToValueAtTime(0.001,t+1.5); o.connect(g); g.connect(A.master); o.start(t); o.stop(t+1.6);
+  const n=ac.createBufferSource(); n.buffer=A.buf; const f=ac.createBiquadFilter(); f.type='lowpass'; f.frequency.setValueAtTime(3000,t); f.frequency.exponentialRampToValueAtTime(150,t+1.4);
+  const ng=ac.createGain(); ng.gain.setValueAtTime(0.7,t); ng.gain.exponentialRampToValueAtTime(0.001,t+1.5); n.connect(f); f.connect(ng); ng.connect(A.master); n.start(t); n.stop(t+1.6); }
+
+// ---------- tracking ----------
+let cover={s:1,ox:0,oy:0,dw:1,dh:1,vw:1280,vh:720};
+function computeCover(){ const vw=video.videoWidth||1280, vh=video.videoHeight||720, s=Math.max(W/vw,H/vh);
+  cover={s,vw,vh,dw:vw*s,dh:vh*s,ox:(W-vw*s)/2,oy:(H-vh*s)/2}; }
+const toScreen = l => ({ x:cover.ox+(1-l.x)*cover.dw, y:cover.oy+l.y*cover.dh });
+const FINGERS=[[8,6],[12,10],[16,14],[20,18]];
+function analyseHand(lms){
+  const {vw,vh}=cover, p3=i=>({x:lms[i].x*vw,y:lms[i].y*vh,z:lms[i].z*vw}), d3=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z);
+  const w=p3(0), ext=FINGERS.map(([t,p])=>d3(w,p3(t))>d3(w,p3(p))*1.12);
+  const pts=lms.map(toScreen);
+  const base={x:(pts[5].x+pts[9].x)/2,y:(pts[5].y+pts[9].y)/2}, tip={x:(pts[8].x+pts[12].x)/2,y:(pts[8].y+pts[12].y)/2};
+  const vx=tip.x-base.x, vy=tip.y-base.y, len=Math.hypot(vx,vy)||1;
+  const two=ext[0]&&ext[1]&&(ext[2]+ext[3])<=1, up=-vy/len>T.upCos;
+  return { pts, ext, base, tip, two, up, ok: two&&up };
+}
+const L_EYE=[33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246], R_EYE=[263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466];
+let F=null;
+function analyseFace(lms){
+  const P=i=>toScreen(lms[i]);
+  const nose=P(1), fw=Math.hypot(P(234).x-P(454).x, P(234).y-P(454).y);
+  const eyes=[[468,469,L_EYE],[473,474,R_EYE]].map(([c,r,ring])=>{ const cc=P(c); return { c:cc, r:Math.hypot(P(r).x-cc.x,P(r).y-cc.y), poly:ring.map(P) }; });
+  return { nose, fw, eyes };
+}
+
+// ---------- geometri rangka (desain orisinal) ----------
+// satuan g, origin = titik tengah garis mata tengkorak, y ke bawah. Lebar tengkorak ≈ 2.4g.
+function bez(p0,p1,p2,p3,n=22){ const o=[]; for(let i=0;i<=n;i++){ const t=i/n,m=1-t;
+  o.push([m*m*m*p0[0]+3*m*m*t*p1[0]+3*m*t*t*p2[0]+t*t*t*p3[0], m*m*m*p0[1]+3*m*m*t*p1[1]+3*m*t*t*p2[1]+t*t*t*p3[1]]); } return o; }
+function ell(cx,cy,rx,ry,a0=0,a1=Math.PI*2,n=40){ const o=[]; for(let i=0;i<=n;i++){ const a=a0+(a1-a0)*i/n; o.push([cx+Math.cos(a)*rx, cy+Math.sin(a)*ry]); } return o; }
+const lerpPts = (a,b,n=16) => Array.from({length:n+1},(_,i)=>[a[0]+(b[0]-a[0])*i/n, a[1]+(b[1]-a[1])*i/n]);
+const RIG=[];
+// tipe: line (garis), taper (tulang/tanduk meruncing), shape (bentuk tertutup: garis tepi + isi), ring (lingkaran sendi)
+const add = (type, pts, o, d, extra={}) => RIG.push({ type, pts, o, d, ...extra });
+const SIDES=[-1,1];
+// tulang belakang: ruas muncul dari bawah ke atas
+add('line', lerpPts([0,9.3],[0,2.4],30), 0.00, 0.22, { w:0.1, grp:'spine' });
+for (let i=0;i<15;i++){ const y=9.1-i*0.46; add('line', [[-0.3,y],[0,y-0.06],[0.3,y]], 0.01+i*0.014, 0.05, { w:0.24, grp:'spine' }); }
+// panggul
+add('shape', [[-0.35,8.8],[0.35,8.8],[0.22,10.2],[0,10.55],[-0.22,10.2]], 0.04, 0.12, { grp:'spine' });
+for (const s of SIDES) add('shape', [[s*0.3,8.75],[s*1.25,8.3],[s*2.25,8.45],[s*2.55,9.25],[s*2.05,10.3],[s*1.05,10.75],[s*0.38,10.25]], 0.06, 0.14, { grp:'spine' });
+// tulang dada + rusuk (bawah dulu)
+add('taper', lerpPts([0,3.0],[0,5.35]), 0.2, 0.1, { w0:0.28, w1:0.12 });
+for (let i=5;i>=0;i--) for (const s of SIDES){ const y=3.15+i*0.52, k=1-0.07*i;
+  add('taper', bez([0,y],[s*1.5*k,y-0.38],[s*2.55*k,y+0.35],[s*2.05*k,y+1.05]), 0.16+(5-i)*0.045, 0.1, { w0:0.24, w1:0.09, grp:'ribs' }); }
+// inti spiral (digambar terpisah) di (0, 6.6)
+// selangka + sendi bahu
+for (const s of SIDES){
+  add('taper', bez([0,2.85],[s*1.0,2.5],[s*2.0,2.45],[s*2.8,2.7]), 0.4, 0.08, { w0:0.24, w1:0.18, grp:'arms' });
+  add('ring', ell(s*3.05,2.85,0.46,0.46), 0.44, 0.07, { w:0.16 });
+  add('ring', ell(s*2.6,3.75,0.32,0.32), 0.46, 0.07, { w:0.13 });
+}
+// lengan atas (bersilang di dada) — kiri dulu, kanan di atasnya
+for (const s of SIDES){
+  const U='U'+s;
+  add('taper', bez([s*3.1,3.25],[s*3.45,3.85],[s*3.5,4.45],[s*3.35,5.0]), 0.48, 0.07, { w0:0.36, w1:0.28, grp:'arms', arm:U, seg:'upper' });
+  add('ring', ell(s*3.35,5.08,0.22,0.22), 0.53, 0.04, { w:0.12, arm:U, seg:'upper' });
+  add('taper', bez([s*3.25,5.12],[s*2.2,5.05],[s*0.6,4.45],[-s*0.8,3.98]), 0.55+(s>0?0.03:0), 0.08, { w0:0.2, w1:0.16, grp:'arms', arm:U, seg:'fore' });
+  add('taper', bez([s*3.2,5.34],[s*2.15,5.3],[s*0.55,4.7],[-s*0.85,4.2]), 0.56+(s>0?0.03:0), 0.08, { w0:0.15, w1:0.12, arm:U, seg:'fore' });
+  add('shape', ell(-s*1.18,3.95,0.46,0.38,0,Math.PI*2,24), 0.62+(s>0?0.03:0), 0.06, { grp:'arms', arm:U, seg:'fore' });
+  for (let f=0;f<3;f++) add('line', ell(-s*(1.0+f*0.2),3.62,0.12,0.1,Math.PI,Math.PI*2,8), 0.66+(s>0?0.03:0), 0.04, { w:0.07, arm:U, seg:'fore' });
+}
+// lengan bawah pemegang pedang
+for (const s of SIDES){
+  const D='D'+s;
+  add('taper', bez([s*2.75,3.95],[s*3.7,4.55],[s*4.4,5.05],[s*4.85,5.5]), 0.5, 0.08, { w0:0.3, w1:0.24, grp:'arms', arm:D, seg:'upper' });
+  add('ring', ell(s*4.92,5.58,0.2,0.2), 0.56, 0.04, { w:0.11, arm:D, seg:'upper' });
+  add('taper', bez([s*4.9,5.68],[s*4.88,6.35],[s*4.65,6.95],[s*4.38,7.42]), 0.58, 0.07, { w0:0.18, w1:0.14, arm:D, seg:'fore' });
+  add('taper', bez([s*5.08,5.7],[s*5.06,6.38],[s*4.84,6.98],[s*4.56,7.44]), 0.59, 0.07, { w0:0.13, w1:0.1, arm:D, seg:'fore' });
+  add('shape', ell(s*4.32,7.68,0.42,0.36,0,Math.PI*2,24), 0.64, 0.06, { grp:'arms', arm:D, seg:'fore' });
+}
+// duri bahu
+for (const s of SIDES) [[2.55,2.55,2.35,1.25],[3.0,2.45,3.12,0.8],[3.45,2.6,3.95,1.3]].forEach(([bx,by,tx,ty],j)=>
+  add('taper', bez([s*bx,by],[s*(bx+tx)/2-s*0.15,(by+ty)/2],[s*tx,ty+0.3],[s*tx,ty]), 0.68+j*0.025, 0.08, { w0:0.34, w1:0.0, grp:'spikes' }));
+// leher
+for (let i=0;i<3;i++){ const y=2.5-i*0.32; add('line', [[-0.22,y],[0,y-0.05],[0.22,y]], 0.6+i*0.02, 0.04, { w:0.2 }); }
+// tengkorak
+const CRANIUM = ell(0,-0.35,1.2,1.15,0.86*Math.PI,2.14*Math.PI,36).concat([[1.12,0.3],[0.95,0.75],[0.65,1.0],[-0.65,1.0],[-0.95,0.75],[-1.12,0.3]]);
+add('shape', CRANIUM, 0.66, 0.12, { grp:'skull' });
+add('shape', [[-0.74,1.06],[0.74,1.06],[0.7,1.45],[0.35,1.75],[0,1.8],[-0.35,1.75],[-0.7,1.45]], 0.72, 0.08, { jaw:true });
+for (const s of SIDES) add('line', [[s*0.12,-0.05],[s*0.5,-0.27],[s*0.86,-0.1],[s*0.76,0.17],[s*0.3,0.2],[s*0.12,-0.05]], 0.75, 0.06, { w:0.08 });
+add('line', [[0,0.38],[0.15,0.7],[-0.15,0.7],[0,0.38]], 0.77, 0.04, { w:0.06 });
+for (let j=-4;j<=4;j++) add('line', [[j*0.13,1.0],[j*0.13,1.17]], 0.78, 0.03, { w:0.045 });
+for (let j=-3;j<=3;j++) add('line', [[j*0.14,1.12],[j*0.14,1.0]], 0.79, 0.03, { w:0.045, jaw:true });
+for (const s of SIDES) add('taper', lerpPts([s*0.34,0.98],[s*0.3,1.42],8), 0.8, 0.04, { w0:0.11, w1:0 });
+add('line', [[0.12,-1.42],[0.3,-1.05],[0.16,-0.8],[0.36,-0.52]], 0.82, 0.05, { w:0.04 });
+// tanduk
+for (const s of SIDES){
+  add('taper', bez([s*0.95,-0.95],[s*2.35,-1.1],[s*2.85,-2.6],[s*2.1,-3.55]), 0.78, 0.13, { w0:0.52, w1:0, grp:'horns' });
+  add('taper', bez([s*0.4,-1.35],[s*0.5,-1.8],[s*0.62,-2.2],[s*0.88,-2.48]), 0.84, 0.07, { w0:0.22, w1:0 });
+  add('taper', bez([s*1.05,-0.45],[s*1.5,-0.38],[s*1.82,-0.7],[s*2.02,-1.02]), 0.86, 0.06, { w0:0.15, w1:0 });
+}
+// pedang (dari gagang ke ujung)
+for (const s of SIDES){
+  add('taper', lerpPts([s*4.42,7.4],[s*3.95,8.95],10), 0.7, 0.05, { w0:0.17, w1:0.15, arm:'D'+s, seg:'fore' });
+  add('line', [[s*4.15,7.05],[s*4.82,7.48]], 0.73, 0.03, { w:0.16, arm:'D'+s, seg:'fore' });
+  add('taper', lerpPts([s*4.55,7.18],[s*6.95,1.05],30), 0.75, 0.13, { w0:0.22, w1:0.03, grp:'swords', arm:'D'+s, seg:'fore' });
+}
+const CORE = { x:0, y:6.6, r:0.78 };
+const SKULL_EYES = SIDES.map(s=>[s*0.5,0.0]);
+const SPAN = 14.2;   // lebar total dalam g (ujung pedang kiri–kanan)
+
+// ---------- penempatan ----------
+let anc={x:0,y:0,fw:120};
+function rigXf(){
+  const g = Math.min(T.giantFace*anc.fw/2.4, T.maxSpan*W/SPAN*1.15);
+  const headTop = anc.y - 0.95*anc.fw;
+  const eyeY = Math.max(headTop - T.giantLift*anc.fw - 1.85*g, H*0.12);
+  return { x:anc.x, y:eyeY, g };
+}
+let X0={x:0,y:0,g:50}, TT=0, JAW=0, CUR_E=null;
+// sendi lengan: U = lengan atas (bersilang), D = lengan bawah (pedang). s = sudut bahu, f = sudut siku (radian)
+const PIV = {}; for (const s of [-1,1]){ PIV['U'+s]={ sh:[s*3.1,3.25], el:[s*3.35,5.08] }; PIV['D'+s]={ sh:[s*2.75,3.95], el:[s*4.92,5.58] }; }
+let ARMS = {}; for (const k in PIV) ARMS[k]={s:0,f:0};
+const rotAbout = (p,c,a) => { if (!a) return p; const co=Math.cos(a), si=Math.sin(a), dx=p[0]-c[0], dy=p[1]-c[1]; return [c[0]+dx*co-dy*si, c[1]+dx*si+dy*co]; };
+function armT(p, e){ if (!e || !e.arm) return p; const J=PIV[e.arm], A=ARMS[e.arm];
+  if (e.seg==='fore') p=rotAbout(p, J.el, A.f); return rotAbout(p, J.sh, A.s); }
+const toXY = (p0, jaw) => { const p=armT(p0, CUR_E); const br=1+0.012*Math.sin(TT*1.5), sway=0.05*Math.sin(TT*0.7);
+  const wob = Math.sin(p[1]*1.3+TT*3.1+p[0])*0.025;
+  return [X0.x+(p[0]*br+sway+wob)*X0.g, X0.y+((p[1]+(jaw?JAW:0))*br+wob*0.6)*X0.g]; };
+
+function strokePart(x2, pts, n, jaw, closed){
+  x2.beginPath(); for (let i=0;i<n;i++){ const [X,Y]=toXY(pts[i],jaw); i?x2.lineTo(X,Y):x2.moveTo(X,Y); } if (closed) x2.closePath(); x2.stroke(); }
+function taperPoly(x2, e, r){
+  const pts=e.pts, N=pts.length, n=Math.max(2,Math.ceil(N*r)), P=pts.slice(0,n).map(p=>toXY(p,e.jaw)), Lf=[], Rt=[];
+  for (let i=0;i<n;i++){ const a=P[Math.max(0,i-1)], b=P[Math.min(n-1,i+1)], dx=b[0]-a[0], dy=b[1]-a[1], l=Math.hypot(dx,dy)||1;
+    const w=(e.w0+(e.w1-e.w0)*(i/(N-1)))*X0.g/2; Lf.push([P[i][0]-dy/l*w, P[i][1]+dx/l*w]); Rt.push([P[i][0]+dy/l*w, P[i][1]-dx/l*w]); }
+  x2.beginPath(); Lf.forEach((p,i)=>i?x2.lineTo(p[0],p[1]):x2.moveTo(p[0],p[1])); for (let i=Rt.length-1;i>=0;i--) x2.lineTo(Rt[i][0],Rt[i][1]); x2.closePath(); x2.fill();
+}
+function fillShape(x2, pts, jaw){ x2.beginPath(); pts.forEach((p,i)=>{ const [X,Y]=toXY(p,jaw); i?x2.lineTo(X,Y):x2.moveTo(X,Y); }); x2.closePath(); x2.fill(); }
+// gambar rangka: sk = garis/tulang (menyala), body = isi tembus pandang
+function drawRig(p, dim=1){
+  const sk=L.sk.x, bd=L.body.x; sk.globalAlpha=dim;
+  for (const e of RIG){
+    const r=clamp01((p-e.o)/e.d); if (r<=0) continue; const er=easeOut(r); CUR_E=e;
+    if (e.type==='line'){ sk.lineWidth=e.w*X0.g; strokePart(sk, e.pts, Math.max(2,Math.ceil(e.pts.length*er)), e.jaw); }
+    else if (e.type==='taper'){ taperPoly(sk, e, er); bd.globalAlpha=dim; taperPoly(bd, e, er); }
+    else if (e.type==='ring'){ sk.lineWidth=e.w*X0.g; strokePart(sk, e.pts, Math.max(2,Math.ceil(e.pts.length*er)), false); if (r>0.5){ bd.globalAlpha=(r-0.5)*2; fillShape(bd, e.pts); } }
+    else if (e.type==='shape'){ sk.lineWidth=0.11*X0.g; strokePart(sk, e.pts, Math.min(e.pts.length, Math.max(2,Math.ceil(e.pts.length*er))), e.jaw, r>=1); if (r>0.4){ bd.globalAlpha=(r-0.4)/0.6; fillShape(bd, e.pts, e.jaw); } }
+  }
+  bd.globalAlpha=1; sk.globalAlpha=1; CUR_E=null;
+}
+function samplePoint(p){ // titik acak dari bagian yang sudah tampil (untuk lidah api)
+  for (let k=0;k<6;k++){ const e=RIG[(Math.random()*RIG.length)|0]; if (p>e.o+e.d){ const q=e.pts[(Math.random()*e.pts.length)|0]; CUR_E=e; const r=toXY(q,e.jaw); CUR_E=null; return r; } } return null; }
+
+// ---------- inti spiral (vektor) ----------
+function drawCore(k, spin, t){
+  if (k<=0) return; const [cx,cy]=toXY([CORE.x,CORE.y]), R=CORE.r*X0.g*(0.5+0.5*easeOut(k));
+  ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.lineCap='round';
+  let g=ctx.createRadialGradient(cx,cy,0,cx,cy,R*2.6); g.addColorStop(0,`rgba(255,120,110,${0.55*k})`); g.addColorStop(0.4,`rgba(255,40,60,${0.25*k})`); g.addColorStop(1,'rgba(255,0,40,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,R*2.6,0,7); ctx.fill();
+  const rot=-t*(1+6*spin);
+  for (let a=0;a<3;a++){ const N=40; ctx.beginPath();
+    for (let i=0;i<=N;i++){ const th=i/N*2.4*Math.PI, rr=R*Math.pow(i/N,0.85), an=th+a*2*Math.PI/3+rot; const X=cx+Math.cos(an)*rr, Y=cy+Math.sin(an)*rr; i?ctx.lineTo(X,Y):ctx.moveTo(X,Y); }
+    ctx.strokeStyle=`rgba(255,70,70,${0.9*k})`; ctx.lineWidth=R*0.22; ctx.shadowColor='rgba(255,40,40,1)'; ctx.shadowBlur=R*0.6; ctx.stroke();
+    ctx.strokeStyle=`rgba(255,220,200,${0.8*k})`; ctx.lineWidth=R*0.07; ctx.shadowBlur=0; ctx.stroke(); }
+  g=ctx.createRadialGradient(cx,cy,0,cx,cy,R*0.45); g.addColorStop(0,`rgba(255,250,240,${k})`); g.addColorStop(1,'rgba(255,120,100,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,R*0.45,0,7); ctx.fill();
+  ctx.restore();
+}
+function drawSkullEyes(k, t){
+  if (k<=0) return; ctx.save(); ctx.globalCompositeOperation='lighter';
+  for (const p of SKULL_EYES){ const [X,Y]=toXY(p), R=0.32*X0.g*(1+0.12*Math.sin(t*9));
+    const g=ctx.createRadialGradient(X,Y,0,X,Y,R*2.4); g.addColorStop(0,`rgba(255,245,240,${k})`); g.addColorStop(0.3,`rgba(255,50,50,${0.9*k})`); g.addColorStop(1,'rgba(255,0,0,0)');
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(X,Y,R*2.4,0,7); ctx.fill(); }
+  ctx.restore();
+}
+
+// ---------- lidah api ----------
+const sprite=(()=>{ const [c,x]=off(); c.width=c.height=64; const g=x.createRadialGradient(32,32,0,32,32,32);
+  g.addColorStop(0,'rgba(255,255,255,1)'); g.addColorStop(0.4,'rgba(255,255,255,.35)'); g.addColorStop(1,'rgba(255,255,255,0)'); x.fillStyle=g; x.fillRect(0,0,64,64); return c; })();
+const tintCache={}; function tinted(){ const key=PAL.name; if (tintCache[key]) return tintCache[key];
+  const [c,x]=off(); c.width=c.height=64; x.drawImage(sprite,0,0); x.globalCompositeOperation='source-in'; x.fillStyle=rgba(PAL.glow,1); x.fillRect(0,0,64,64);
+  x.globalCompositeOperation='lighter'; x.globalAlpha=0.6; x.drawImage(sprite,16,16,32,32); return tintCache[key]=c; }
+let _hot=null; function hotSprite(){ if (_hot) return _hot; const [c,x]=off(); c.width=c.height=64; x.drawImage(sprite,0,0); x.globalCompositeOperation='source-in';
+  x.fillStyle='rgb(255,60,30)'; x.fillRect(0,0,64,64); x.globalCompositeOperation='lighter'; x.globalAlpha=0.7; x.drawImage(sprite,16,16,32,32); return _hot=c; }
+const licks=[];
+function emitLicks(p, n){ for (let i=0;i<n;i++){ const q=samplePoint(p); if (!q) continue;
+  licks.push({ x:q[0], y:q[1], vx:(Math.random()-0.5)*X0.g*0.4, vy:-X0.g*(1.2+Math.random()*1.8), r:X0.g*(0.12+Math.random()*0.22), age:0, life:0.4+Math.random()*0.6 }); } }
+function drawLicks(dt){
+  ctx.save(); ctx.globalCompositeOperation='lighter'; const spr=tinted();
+  for (let i=licks.length-1;i>=0;i--){ const p=licks[i]; p.age+=dt; if (p.age>p.life){ licks.splice(i,1); continue; }
+    const k=p.age/p.life; p.x+=p.vx*dt; p.y+=p.vy*dt; const r=p.r*(1-k*0.6);
+    ctx.globalAlpha=(1-k)*0.7; ctx.drawImage(p.hot?hotSprite():spr, p.x-r*0.6, p.y-r*1.6, r*1.2, r*3.2); }
+  ctx.restore();
+}
+
+
+// ---------- zirah (desain orisinal) ----------
+// tiap pelat: bentuk tertutup yang melayang dari "off" (satuan g) lalu mengunci ke tempatnya
+const ARM=[];
+const centroid = pts => pts.reduce((a,p)=>[a[0]+p[0]/pts.length, a[1]+p[1]/pts.length],[0,0]);
+const addA = (pts, o, d, off, extra={}) => ARM.push({ pts, o, d, off, rot0: extra.rot0||0, c: centroid(pts), ...extra });
+function plate(cx,cy,w,h,rot,curve=0.25){ const o=[];
+  for (let i=0;i<=10;i++){ const t=i/10, x=-w/2+w*t; o.push([x, -h/2 - curve*h*Math.sin(Math.PI*t)]); }
+  for (let i=0;i<=10;i++){ const t=i/10, x=w/2*0.9-w*0.9*t; o.push([x, h/2 - curve*h*0.6*Math.sin(Math.PI*t)]); }
+  const c=Math.cos(rot), s=Math.sin(rot); return o.map(([x,y])=>[cx+x*c-y*s, cy+x*s+y*c]); }
+function band(pts, t0, t1, wid){ // pita mengikuti tulang
+  const n=pts.length, a=Math.floor(t0*(n-1)), b=Math.ceil(t1*(n-1)), L=[], R=[];
+  for (let i=a;i<=b;i++){ const p=pts[i], q=pts[Math.min(n-1,i+1)], r=pts[Math.max(0,i-1)], dx=q[0]-r[0], dy=q[1]-r[1], l=Math.hypot(dx,dy)||1;
+    const w=wid/2*(1-0.25*Math.abs((i-a)/(b-a||1)*2-1)); L.push([p[0]-dy/l*w, p[1]+dx/l*w]); R.push([p[0]+dy/l*w, p[1]-dx/l*w]); }
+  return L.concat(R.reverse()); }
+// pelat dada
+addA([[-2.3,2.9],[-1.1,2.75],[0,2.95],[1.1,2.75],[2.3,2.9],[2.55,4.2],[2.05,5.6],[0,6.0],[-2.05,5.6],[-2.55,4.2]], 0.0, 0.14, [0,2.6],
+  { fillA:0.55, lines:[[[0,3.0],[0,5.9]],[[-2.35,3.75],[-0.2,3.95]],[[0.2,3.95],[2.35,3.75]],[[-2.2,4.6],[-0.2,4.8]],[[0.2,4.8],[2.2,4.6]]],
+    cracks:[[[-1.6,3.2],[-1.3,3.5],[-1.5,3.8],[-1.1,4.2]],[[1.4,4.9],[1.1,5.15],[1.3,5.4]]] });
+// sabuk + simpul + rok pelat
+addA([[-2.45,6.95],[2.45,6.95],[2.6,7.75],[-2.6,7.75]], 0.08, 0.1, [0,2.2], { fillA:0.6, lines:[[[-2.5,7.35],[2.5,7.35]]] });
+addA([[-0.35,7.6],[0.35,7.6],[0.55,8.9],[0.1,8.7],[0,9.0],[-0.1,8.7],[-0.55,8.9]], 0.13, 0.08, [0,1.6], { fillA:0.5 });
+for (const s of SIDES) for (let j=0;j<3;j++){ const cx=s*(0.95+j*0.7), rot=s*(0.08+j*0.1);
+  addA(plate(cx,8.6+j*0.12,0.75,1.5,rot,0.05), 0.15+j*0.03, 0.09, [s*0.6,2.0], { fillA:0.45, lines:[[[cx-0.3,8.5+j*0.12],[cx+0.3,8.5+j*0.12]],[[cx-0.3,9.0+j*0.12],[cx+0.3,9.0+j*0.12]]] }); }
+// pelindung bahu berlapis (atas ke bawah)
+for (const s of SIDES) for (let j=0;j<3;j++){ const cx=s*(3.25+0.12*j), cy=2.15+0.58*j;
+  addA(plate(cx,cy,2.1-0.12*j,0.6,s*0.32,0.3), 0.26+j*0.07, 0.1, [s*3.2,-1.2], { rot0:s*0.6, fillA:0.6,
+    cracks: j===1 ? [[[cx-s*0.6,cy-0.1],[cx-s*0.25,cy+0.05],[cx,cy-0.12],[cx+s*0.35,cy+0.05]]] : [] }); }
+// pelindung lengan (ikut tulang lengan dari RIG)
+const bone = (o,s) => RIG.find(e=>e.type==='taper' && Math.abs(e.o-o)<1e-6 && Math.sign(e.pts[0][0])===s);
+for (const s of SIDES){
+  const fa=bone(0.55+(s>0?0.03:0), s); if (fa) addA(band(fa.pts,0.18,0.62,0.62), 0.46+(s>0?0.03:0), 0.08, [s*2.5,0.6], { fillA:0.55, arm:'U'+s, seg:'fore', cracks:[band(fa.pts,0.3,0.5,0.0).slice(0,4)] });
+  const lo=bone(0.58, s); if (lo) addA(band(lo.pts,0.1,0.8,0.62), 0.52, 0.08, [s*2.2,0.8], { fillA:0.55, arm:'D'+s, seg:'fore' });
+  const up=bone(0.5, s); if (up) addA(band(up.pts,0.35,0.95,0.55), 0.55, 0.08, [s*2.0,-0.6], { fillA:0.5, arm:'D'+s, seg:'upper' });
+}
+// helm: kubah + pelindung samping
+addA(ell(0,-0.45,1.48,1.32,Math.PI*1.02,Math.PI*1.98,30).concat([[1.42,-0.25],[0,-0.62],[-1.42,-0.25]]), 0.62, 0.1, [0,-3.0], { fillA:0.55,
+  lines:[[[-1.3,-0.9],[0,-1.15],[1.3,-0.9]]], cracks:[[[0.5,-1.55],[0.65,-1.25],[0.5,-1.0]]] });
+for (const s of SIDES) addA([[s*1.35,-0.6],[s*2.05,-0.95],[s*2.25,-0.35],[s*1.9,0.25],[s*1.3,0.1]], 0.67, 0.08, [s*2.0,-1.0], { rot0:s*0.5, fillA:0.5 });
+// topeng (garang, orisinal): alis bersudut, pipi tajam, taring
+const MASK=[[-1.32,-0.5],[-0.62,-0.82],[0,-0.62],[0.62,-0.82],[1.32,-0.5],[1.22,0.18],[1.0,0.62],[0.85,1.1],[0.5,1.55],[0,1.72],[-0.5,1.55],[-0.85,1.1],[-1.0,0.62],[-1.22,0.18]];
+addA(MASK, 0.72, 0.1, [0,-2.6], { fillA:0.62, mask:true,
+  lines:[[[-1.05,-0.45],[-0.2,-0.25]],[[1.05,-0.45],[0.2,-0.25]],[[-1.0,0.55],[-0.55,0.75]],[[1.0,0.55],[0.55,0.75]],[[-0.62,1.05],[0,1.18],[0.62,1.05]],[[-0.12,0.35],[0,0.62],[0.12,0.35]]],
+  cracks:[[[-0.9,0.0],[-0.7,0.25],[-0.85,0.45]]] });
+addA([[0,-1.35],[0.22,-1.0],[0,-0.75],[-0.22,-1.0]], 0.8, 0.05, [0,-1.2], { fillA:0.8 });          // lambang dahi
+for (const s of SIDES) addA([[s*0.32,1.02],[s*0.5,1.02],[s*0.42,1.5]], 0.82, 0.05, [0,0.6], { fillA:0.85 });   // taring atas
+for (const s of SIDES) addA([[s*0.16,1.2],[s*0.3,1.2],[s*0.23,0.98]], 0.83, 0.05, [0,0.6], { fillA:0.85 });     // taring bawah
+const MASK_EYES = SIDES.map(s=>[[s*0.2,-0.08],[s*0.86,-0.38],[s*0.8,-0.02],[s*0.3,0.1]]);
+
+// posisi pelat pada progres r (0..1): melayang + berputar lalu mengunci (sedikit melewati = "klik")
+const easeOutBack = v => { const c=1.9; return 1 + (c+1)*Math.pow(v-1,3) + c*Math.pow(v-1,2); };
+function armPts(e, r, list){ const k=easeOutBack(r), m=1-k, rot=e.rot0*m, c=Math.cos(rot), s=Math.sin(rot);
+  return (list||e.pts).map(([x,y])=>{ const dx=x-e.c[0], dy=y-e.c[1]; return [e.c[0]+dx*c-dy*s+e.off[0]*m, e.c[1]+dx*s+dy*c+e.off[1]*m]; }); }
+function polyPath(x2, pts, closed=true){ x2.beginPath(); pts.forEach((p,i)=>{ const [X,Y]=toXY(p); i?x2.lineTo(X,Y):x2.moveTo(X,Y); }); if (closed) x2.closePath(); }
+function drawArmor(q, t){
+  const sk=L.sk.x, ar=L.armor.x;
+  for (let i=0;i<ARM.length;i++){ const e=ARM[i], r=clamp01((q-e.o)/e.d); if (r<=0) continue;
+    const P=armPts(e,r), a=Math.min(1,r*2.5);
+    if (r>=1 && !e.snapT){ e.snapT=S.t; sfxClank(0.6+0.4*Math.random()); }
+    if (r<1) e.snapT=0;
+    CUR_E=e; ar.globalAlpha=a; polyPath(ar,P); ar.fill();
+    if (e.snapT){ const f=Math.max(0,1-(S.t-e.snapT)*4); if (f>0){ sk.globalAlpha=f*0.5; polyPath(sk,P); sk.fill(); } }
+  }
+  sk.globalAlpha=1; ar.globalAlpha=1; CUR_E=null;
+}
+function drawCracks(k, t){ if (k<=0) return; const pulse=0.55+0.45*Math.sin(t*3.1)*Math.sin(t*1.7+0.5);
+  ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.lineCap=ctx.lineJoin='round';
+  for (const e of ARM){ if (!e.cracks || !e.snapT) continue; CUR_E=e; for (const c of e.cracks){ if (c.length<2) continue;
+    polyPath(ctx, c, false); ctx.strokeStyle=`rgba(255,40,40,${0.8*k*pulse})`; ctx.lineWidth=0.09*X0.g; ctx.shadowColor='rgba(255,30,30,1)'; ctx.shadowBlur=X0.g*0.5; ctx.stroke();
+    ctx.strokeStyle=`rgba(255,210,190,${0.7*k*pulse})`; ctx.lineWidth=0.03*X0.g; ctx.shadowBlur=0; ctx.stroke(); } }
+  CUR_E=null; ctx.restore(); }
+function drawMaskEyes(k, t){ if (k<=0) return; ctx.save(); ctx.globalCompositeOperation='lighter';
+  for (const eye of MASK_EYES){ polyPath(ctx, eye); ctx.fillStyle=`rgba(255,235,225,${k})`; ctx.shadowColor='rgba(255,30,30,1)'; ctx.shadowBlur=X0.g*(0.8+0.2*Math.sin(t*9)); ctx.fill();
+    const [cx,cy]=toXY(centroid(eye)), R=X0.g*1.1; const g=ctx.createRadialGradient(cx,cy,0,cx,cy,R); g.addColorStop(0,`rgba(255,60,50,${0.6*k})`); g.addColorStop(1,'rgba(255,0,0,0)');
+    ctx.shadowBlur=0; ctx.fillStyle=g; ctx.beginPath(); ctx.arc(cx,cy,R,0,7); ctx.fill(); }
+  ctx.restore(); }
+const BLADES = RIG.filter(e=>e.grp==='swords');
+function emitBladeFire(k){ if (k<=0) return;
+  for (const b of BLADES) for (let i=0;i<3;i++){ if (Math.random()>k) continue; const q=b.pts[(Math.random()*b.pts.length)|0]; CUR_E=b; const [X,Y]=toXY(q); CUR_E=null;
+    licks.push({ x:X, y:Y, vx:(Math.random()-0.5)*X0.g*0.5, vy:-X0.g*(1.5+Math.random()*2), r:X0.g*(0.15+Math.random()*0.25), age:0, life:0.3+Math.random()*0.45, hot:true }); } }
+
+// ---------- mask / cutout ----------
+let maskImg=null, hasPerson=false;
+function onMask(mask){
+  const mw=mask.width, mh=mask.height, conf=mask.getAsFloat32Array();
+  if (maskC.width!==mw||maskC.height!==mh){ maskC.width=mw; maskC.height=mh; maskImg=maskX0.createImageData(mw,mh); }
+  const px=maskImg.data, lo=T.maskLo, span=T.maskHi-T.maskLo; let n=0;
+  for (let i=0,j=0;i<conf.length;i++,j+=4){ const a=clamp01((conf[i]-lo)/span); px[j]=px[j+1]=px[j+2]=255; px[j+3]=a*255; if (a>0.5) n++; }
+  maskX0.putImageData(maskImg,0,0); hasPerson=n>200;
+  const k=Math.min(1,960/cover.vw); const cw=Math.round(cover.vw*k), ch=Math.round(cover.vh*k);
+  if (cutC.width!==cw){ cutC.width=cw; cutC.height=ch; }
+  cutX.globalCompositeOperation='copy'; cutX.drawImage(video,0,0,cw,ch);
+  cutX.globalCompositeOperation='destination-in'; cutX.filter='blur(1.5px)'; cutX.drawImage(maskC,0,0,cw,ch); cutX.filter='none'; cutX.globalCompositeOperation='source-over';
+}
+function drawMirrored(x2, src, sc){ x2.save(); x2.translate((cover.ox+cover.dw)*sc, cover.oy*sc); x2.scale(-1,1); x2.drawImage(src,0,0,cover.dw*sc,cover.dh*sc); x2.restore(); }
+
+// ---------- mata (desain orisinal) ----------
+// m = 0: tiga titik biasa · m = 1: empat bilah bulan sabit tajam
+function drawEye(e, k, rot, m){
+  if (k<=0.01) return; const {c,r}=e, R=r*1.05*(0.6+0.4*k);
+  ctx.save();
+  ctx.beginPath(); e.poly.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.closePath(); ctx.clip();
+  ctx.globalAlpha=k;
+  let g=ctx.createRadialGradient(c.x,c.y,0,c.x,c.y,R); g.addColorStop(0,'#ff3a3a'); g.addColorStop(0.65,'#d4101c'); g.addColorStop(1,'#4a0006');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(c.x,c.y,R,0,7); ctx.fill();
+  ctx.translate(c.x,c.y); ctx.rotate(rot); ctx.fillStyle='#0c0002'; ctx.strokeStyle='#0c0002';
+  if (m<1){ ctx.globalAlpha=k*(1-m); for (let b=0;b<3;b++){ const a=b*Math.PI*2/3; ctx.beginPath(); ctx.arc(Math.cos(a)*R*0.55,Math.sin(a)*R*0.55,R*0.13,0,7); ctx.fill(); }
+    ctx.lineWidth=R*0.05; ctx.beginPath(); ctx.arc(0,0,R*0.55,0,7); ctx.stroke(); }
+  if (m>0){ ctx.globalAlpha=k*Math.min(1,m*1.5); const sc=0.4+0.6*ease(m);
+    for (let b=0;b<4;b++){ const a=b*Math.PI/2;
+      const P=(ang,rad)=>[Math.cos(a+ang)*R*rad*sc, Math.sin(a+ang)*R*rad*sc];
+      const p0=P(0,0.32), tip=P(0.95,0.97), c1=P(0.25,1.05), c2=P(0.75,0.45), p1=P(0.42,0.32);
+      ctx.beginPath(); ctx.moveTo(...p0); ctx.quadraticCurveTo(...c1,...tip); ctx.quadraticCurveTo(...c2,...p1); ctx.closePath(); ctx.fill(); }
+    ctx.lineWidth=R*0.09; ctx.beginPath(); ctx.arc(0,0,R*0.32*sc,0,7); ctx.stroke(); }
+  ctx.globalAlpha=k; ctx.lineWidth=R*0.07; ctx.beginPath(); ctx.arc(0,0,R*0.95,0,7); ctx.stroke();
+  ctx.fillStyle='#000'; ctx.beginPath(); ctx.arc(0,0,R*0.12,0,7); ctx.fill();
+  ctx.restore();
+  ctx.save(); ctx.globalCompositeOperation='lighter'; ctx.globalAlpha=0.5*k;
+  g=ctx.createRadialGradient(c.x,c.y,0,c.x,c.y,R*3); g.addColorStop(0,'rgba(255,40,40,.9)'); g.addColorStop(1,'rgba(255,0,0,0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(c.x,c.y,R*3,0,7); ctx.fill(); ctx.restore();
+}
+
+// ---------- state ----------
+const S={ on:false, hold:0, cool:0, t:0, t0:-99, tOff:-99, I:0, ev:{} };
+window.__S=S;
+function toggle(){ S.cool=T.cooldown; S.hold=0;
+  if (!S.on){ S.on=true; S.t0=S.t; S.ev={}; sfxShing(); } else { S.on=false; S.tOff=S.t; sfxWhoosh(0.6,2000,200,0.25); } }
+let shake=0, flash=0;
+function once(key, fn){ if (!S.ev[key]){ S.ev[key]=true; fn(); } }
+function prepLayer(l){ l.x.setTransform(1,0,0,1,0,0); l.x.clearRect(0,0,l.c.width,l.c.height); l.x.setTransform(0.5,0,0,0.5,0,0); }
+function tintTo(src, dst, col){ dst.x.setTransform(1,0,0,1,0,0); dst.x.globalCompositeOperation='copy'; dst.x.drawImage(src.c,0,0);
+  dst.x.globalCompositeOperation='source-in'; dst.x.fillStyle=col; dst.x.fillRect(0,0,dst.c.width,dst.c.height); dst.x.globalCompositeOperation='source-over'; }
+function blit(l, alpha, blur){ if (alpha<=0.003) return; ctx.globalAlpha=alpha; ctx.filter=blur?`blur(${blur}px)`:'none'; ctx.drawImage(l.c,0,0,W,H); ctx.filter='none'; }
+
+// ---------- loop ----------
+let last=performance.now(), lastVid=-1, hs=[], fpsAcc=0,fpsN=0,fps=0;
+function frame(now){
+  const dt=Math.min(0.05,(now-last)/1000)*TS; last=now; S.t+=dt; const t=S.t; TT=t;
+  fpsAcc+=dt/TS; fpsN++; if (fpsAcc>0.5){ fps=Math.round(fpsN/fpsAcc); fpsAcc=0; fpsN=0; }
+  if (video.readyState>=2 && video.currentTime!==lastVid){
+    lastVid=video.currentTime; computeCover();
+    if (hands) hs=(hands.detectForVideo(video,now).landmarks||[]).map(analyseHand);
+    if (face){ const r=face.detectForVideo(video,now); F=r.faceLandmarks?.[0]?analyseFace(r.faceLandmarks[0]):null; }
+    if (seg) seg.segmentForVideo(video,now,res=>{ const m=res.confidenceMasks?.[0]; if (m) onMask(m); });
+  }
+  // gesture
+  const gst=hs.find(h=>h.ok);
+  if (S.cool>0) S.cool-=dt; else if (gst){ S.hold+=dt; if (S.hold>=T.holdGesture) toggle(); } else S.hold=Math.max(0,S.hold-dt*2);
+
+  // timeline
+  const since=t-S.t0, out=t-S.tOff;
+  const eyeK = S.on ? clamp01(since/0.3) : clamp01(1-out/1.4);
+  const morph = S.on ? ease(clamp01((since-0.35)/0.45)) : 1;
+  const p = S.on ? clamp01((since-0.75)/T.build) : clamp01(1-out/0.9);   // menonaktifkan = rangka menyusut balik
+  const coreK = clamp01((p-0.24)/0.12), spin = ease(clamp01((p-0.3)/0.6)), skullEyes = clamp01((p-0.95)/0.05);
+  const q = S.on ? clamp01((since-0.75-T.build-0.35)/T.armorBuild) : clamp01(1-out/0.6);   // zirah
+  const crackK = clamp01((q-0.85)/0.1), bladeK = clamp01((q-0.88)/0.08), maskEyes = clamp01((q-0.96)/0.04);
+  S.I = S.on ? clamp01((since-0.6)/0.5) : clamp01(1-out/1.0);
+  // gerakan lengan setelah zirah terpasang
+  const armorEnd = 0.75+T.build+0.35+T.armorBuild;
+  const mT = S.on ? ease(ease(clamp01((since-armorEnd-0.35)/1.4))) : 0;
+  S.m = (S.m||0) + (mT-(S.m||0))*Math.min(1, dt*(S.on?8:5)); const m=S.m;
+  // satu ayunan pedang halus (kedua pedang bersamaan), hanya sekali
+  let slash=0; const tc=since-armorEnd-1.9;
+  if (S.on && T.sweep && tc>0 && tc<1.8){ slash=0.55*Math.sin(Math.PI*ease(tc/1.8)); once('sweep', ()=>sfxWhoosh(1.2,250,2200,0.3)); }
+  S.slashHot = slash>0.3 ? 1 : 0;
+  for (const s of [-1,1]){
+    ARMS['U'+s] = { s:(-s*0.3 + 0.025*Math.sin(t*0.9+s))*m, f:(s*1.75 + 0.03*Math.sin(t*1.1+s))*m };
+    ARMS['D'+s] = { s:(-s*0.22 + 0.03*Math.sin(t*0.9+2*s))*m + s*slash*m, f:0.04*Math.sin(t*1.1+s)*m };
+  }
+  if (S.on && m>0.05) once('unfold', ()=>{ sfxWhoosh(0.9,180,1600,0.4); sfxClank(0.7); });
+  if (S.on){
+    if (since>0.4) once('morph', ()=>{ sfxShing(); flash=0.2; });
+    [['spine',0.01],['ribs',0.17],['arms',0.45],['spikes',0.68],['skull',0.66],['horns',0.78],['swords',0.75]].forEach(([k,o])=>{ if (p>o) once(k, ()=>{ sfxWhoosh(0.6,250,1800,0.25); sfxCrack(); }); });
+    if (coreK>0.05) once('core', sfxShing);
+    if (skullEyes>=1) once('boom', ()=>{ sfxBoom(); shake=0.7; flash=0.35; });
+    if (q>0.001) once('armor', ()=>sfxWhoosh(1.0,200,2600,0.3));
+    if (bladeK>0.05) once('blade', ()=>sfxWhoosh(0.7,500,3500,0.35));
+    if (maskEyes>=1) once('boom2', ()=>{ sfxBoom(); shake=1.2; flash=0.6; });
+  }
+  audioLevel(S.I, Math.max(spin*0.6, q));
+  // posisi: ikuti wajah dengan halus
+  const tgt = F ? { x:F.nose.x, y:F.nose.y, fw:F.fw } : { x:W/2, y:H*0.45, fw:Math.min(W,H)*0.22 };
+  const sm = anc.fw===120 && anc.x===0 ? 1 : 0.3; anc={ x:anc.x+(tgt.x-anc.x)*sm, y:anc.y+(tgt.y-anc.y)*sm, fw:anc.fw+(tgt.fw-anc.fw)*sm };
+  X0 = rigXf(); JAW = 0.08 + 0.06*Math.sin(t*2.3) + (skullEyes>0 ? 0.12*Math.max(0,1-(t-S.t0-0.75-T.build)*1.5) : 0);
+
+  // ---- render ----
+  ctx.save();
+  if (shake>0){ const m=shake*16; ctx.translate((Math.random()-0.5)*m,(Math.random()-0.5)*m); shake=Math.max(0,shake-dt*1.5); }
+  ctx.fillStyle='#000'; ctx.fillRect(-30,-30,W+60,H+60);
+  if (video.readyState>=2){
+    drawMirrored(ctx, video, 1);
+    if (S.I>0){
+      ctx.fillStyle=`rgba(8,0,18,${0.45*S.I})`; ctx.fillRect(-30,-30,W+60,H+60);
+      // aura tipis dari siluet tubuh
+      if (hasPerson){ const au=L.aura; au.x.setTransform(1,0,0,1,0,0); au.x.globalCompositeOperation='copy'; drawMirrored(au.x, maskC, 0.5);
+        au.x.globalCompositeOperation='source-in'; au.x.fillStyle=rgba(PAL.glow,1); au.x.fillRect(0,0,au.c.width,au.c.height); au.x.globalCompositeOperation='source-over';
+        ctx.save(); ctx.globalCompositeOperation='lighter'; const bx=W/2, by=cover.oy+cover.dh, sc=1.07+0.02*Math.sin(t*8);
+        ctx.translate(bx,by); ctx.scale(sc,sc); ctx.translate(-bx,-by); blit(au, 0.5*S.I, 14); ctx.restore(); }
+      // rangka
+      prepLayer(L.sk); prepLayer(L.body);
+      L.sk.x.fillStyle=L.sk.x.strokeStyle='#fff'; L.body.x.fillStyle='#fff';
+      L.sk.x.lineCap=L.sk.x.lineJoin='round';
+      prepLayer(L.armor); L.armor.x.fillStyle='#fff';
+      drawRig(p, 1-T.boneDim*q);
+      drawArmor(q, t);
+      tintTo(L.sk, L.skT, rgba(PAL.glow,1)); tintTo(L.body, L.bodyT, rgba(PAL.glow,1)); tintTo(L.armor, L.armorT, rgba(PAL.glow,1));
+      ctx.save(); ctx.globalCompositeOperation='lighter'; const fl=0.88+0.12*Math.sin(t*13)*Math.sin(t*5.1);
+      blit(L.bodyT, T.bodyAlpha*S.I, 0);          // isi tembus pandang
+      blit(L.skT, 0.95*S.I*fl, 20);               // cahaya luar
+      blit(L.skT, 0.85*S.I*fl, 6);
+      blit(L.sk, 0.6*S.I, 0);                     // inti putih
+      ctx.restore();
+      // zirah: warna gelap pekat tanpa garis, cahaya tipis di sekelilingnya
+      if (q>0){ const dk=PAL.glow.map(v=>Math.round(v*T.armorShade)); tintTo(L.armor, L.armorD, rgba(dk,1));
+        ctx.save(); ctx.globalCompositeOperation='lighter'; blit(L.armorT, 0.3*S.I, 18); ctx.restore();
+        blit(L.armorD, T.armorAlpha*S.I, 0);
+        ctx.save(); ctx.globalCompositeOperation='lighter'; blit(L.armorT, 0.08*S.I, 0); ctx.restore(); }
+      drawCore(coreK*S.I, spin, t);
+      drawSkullEyes(skullEyes*S.I*(1-clamp01((q-0.7)/0.1)), t);
+      drawCracks(crackK*S.I, t);
+      drawMaskEyes(maskEyes*S.I, t);
+      if (hasPerson && cutC.width) drawMirrored(ctx, cutC, 1);   // orang asli di depan
+      if (Math.random()<S.I) emitLicks(p, 2+Math.round(2*spin));
+      emitBladeFire(bladeK*S.I);
+      if (S.slashHot) emitBladeFire(S.I);
+    }
+  }
+  drawLicks(dt);
+  if (F) F.eyes.forEach(e=>drawEye(e, eyeK, -t*(1.2+10*clamp01(1-Math.abs(since-0.55)/0.4)*(S.on?1:0)), morph));
+  if (showLm) hs.forEach(drawHand);
+  ctx.restore();
+  if (flash>0){ ctx.fillStyle=rgba(PAL.core,flash); ctx.fillRect(0,0,W,H); flash=Math.max(0,flash-dt*2); }
+  if (S.on && since<0.3){ ctx.fillStyle=`rgba(255,0,20,${0.35*(1-since/0.3)})`; ctx.fillRect(0,0,W,H); }
+
+  // hud
+  const lab = S.on ? (S.cool>0?'':'Ulangi gerakan untuk menonaktifkan') : gst ? 'Tahan…' : !F ? 'Wajah belum terdeteksi' : 'Dua jari menunjuk ke atas';
+  $label.textContent=lab; $label.style.opacity=lab?1:0;
+  $fill.style.width=Math.min(1,S.hold/T.holdGesture)*100+'%';
+  $stat.textContent=`${fps} fps · tangan ${hs.length} ${hs.map(h=>h.ok?'☝':h.two?'✌':'·').join('')} · wajah ${F?'ya':'tidak'} · ${PAL.name}`;
+  requestAnimationFrame(frame);
+}
+const HB=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function drawHand(h){
+  ctx.strokeStyle=h.ok?rgba(PAL.glow,.9):'rgba(255,255,255,.5)'; ctx.lineWidth=2;
+  for (const [a,b] of HB){ ctx.beginPath(); ctx.moveTo(h.pts[a].x,h.pts[a].y); ctx.lineTo(h.pts[b].x,h.pts[b].y); ctx.stroke(); }
+  ctx.fillStyle='#fff'; ctx.font='bold 13px sans-serif'; ctx.fillText(h.ext.map(e=>e?'1':'0').join('')+(h.up?' ↑':''), h.pts[0].x+8, h.pts[0].y+16);
+}
+
+// ---------- boot ----------
+async function loadModels(){
+  $label.textContent='Memuat model…';
+  const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const M="https://storage.googleapis.com/mediapipe-models/";
+  [hands, face, seg] = await Promise.all([
+    HandLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate:"GPU" }, runningMode:"VIDEO", numHands:2 }),
+    FaceLandmarker.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate:"GPU" }, runningMode:"VIDEO", numFaces:1 }),
+    ImageSegmenter.createFromOptions(fs,{ baseOptions:{ modelAssetPath:M+"image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite", delegate:"GPU" }, runningMode:"VIDEO", outputCategoryMask:false, outputConfidenceMasks:true }),
+  ]);
+}
+document.getElementById('go').onclick=async()=>{
+  const err=document.getElementById('err'); err.textContent=''; initAudio();
+  try{
+    if (params.get('src')) video.src=params.get('src');
+    else video.srcObject=await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+    await video.play(); await loadModels();
+    document.getElementById('start').classList.add('hide');
+    if (!running){ running=true; requestAnimationFrame(frame); }
+  }catch(e){ console.error(e); err.textContent='Gagal: '+(e.message||e.name); }
+};
+addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if (PALETTES[k]){ PAL=PALETTES[k]; document.documentElement.style.setProperty('--c', rgba(PAL.glow,1)); }
+  if (k==='h'){ showHud=!showHud; document.getElementById('hud').classList.toggle('hide',!showHud); }
+  if (k==='l') showLm=!showLm;
+  if (k==='k') toggle();
+  if (k==='r'){ S.on=false; S.tOff=S.t-5; S.hold=0; }
+});
+</script>
+<script src="../shared/start.js"></script>
+</body>
+</html>
